@@ -4,10 +4,12 @@
 #
 #   ./exp_m3.sh            (expects python/data/distill from collect_distill.py)
 #
-# Sweep (equal data, equal epochs, all trained with the random loop prior):
-#   d256_222   7M   small baseline
-#   d384_242  18M   deep stack
-#   d512_121  18.5M wide + shallow (the default), also play-tested with adaptive loops
+# Sweep (equal data, equal epochs):
+#   d256_222   7M   small baseline, random loop prior
+#   d384_242  18M   deep stack, NO loops (--loop-prior 1). Its depth comes from unique layers;
+#                   looping its 4-layer core to x4 is 20 effective layers and ran out of memory
+#   d512_121  18.5M wide + shallow (the default), random loop prior; also play-tested with
+#                   adaptive loops
 set -uo pipefail
 ROOT=/home/kyler/Documents/AlphaSlayer
 PY=$ROOT/python/.venv7/bin/python
@@ -26,10 +28,11 @@ $PY eval_unified.py --teacher --runs "$RUNS" --out m3_eval_teacher.json 2>&1 \
   | grep -vE "amdgpu|Warning|warn|nested" | tail -6 | tee -a "$LOG"
 pkill -9 -x SlayTheSpire2 2>/dev/null; sleep 3
 
+declare -A PRIOR=([d512_121]="0.4,0.3,0.2,0.1" [d384_242]="1" [d256_222]="0.4,0.3,0.2,0.1")
 for CFG in d512_121 d384_242 d256_222; do
-  say "train $CFG"
+  say "train $CFG (loop prior ${PRIOR[$CFG]})"
   $PY train_distill.py --data data/distill --config "$CFG" --out "unified_m3_$CFG.pt" \
-      --epochs "$EPOCHS" --bf16 2>&1 | grep -E "^data|^model|^epoch|Traceback|Error" | tee -a "$LOG"
+      --epochs "$EPOCHS" --bf16 --loop-prior "${PRIOR[$CFG]}" 2>&1 | grep -E "^data|^model|^epoch|Traceback|Error" | tee -a "$LOG"
   if [ ! -f "unified_m3_$CFG.pt" ]; then say "!! $CFG produced no checkpoint"; continue; fi
   say "play-test $CFG, one pass"
   $PY eval_unified.py --ckpt "unified_m3_$CFG.pt" --loop 1 --bf16 --runs "$RUNS" \

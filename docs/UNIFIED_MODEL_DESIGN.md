@@ -201,7 +201,7 @@ GAE across the fight/run boundary; per-group averaging weights.
 |---|---|---|
 | M1 | probe additions above | **DONE 2026-09-26.** Live delivery tests pass and fail on the old DLL; no vocab index moved; no game side effects |
 | M2 | encoder + model | **DONE 2026-09-26.** `alphaslayer/unified/`, `tests/test_unified.py`: 45 delivery checks (every M1 field changes the output), reference alignment, order invariance, batch isolation, loops; four reintroduced bugs all caught |
-| M3 | distillation | held-out agreement reported; act-1 within 2 SE of the teachers on paired seeds |
+| M3 | distillation | **DONE 2026-09-26, all configs pass.** 2,005 teacher runs (786k decisions). Every size matches r5 in play within noise (act 1 0.76-0.80 vs 0.766; win 0.044-0.057 vs 0.048) at 91.3-91.6% held-out agreement. Results below |
 | M4 | `train_unified.py` | win-only reward + aux heads; V(post) fight terminals; buffer-math tests; 50-iteration smoke run |
 | M5 | capability eval suite | every eval in `CAPABILITIES.md` runs on a checkpoint and on r5, with a report |
 | M6 | training round | per-boss, per-act and per-capability comparison against continuing r5, on paired seeds |
@@ -214,3 +214,36 @@ GAE across the fight/run boundary; per-group averaging weights.
 
 Open issue that blocks replay search (step 3), not this: the serve-mode determinism race after a
 player death (see memory: probe-determinism-status).
+
+## M3 results (2026-09-26)
+
+Distilled from r5 on 2,005 runs (786k decisions, 10% of runs held out); play-tested on 500 fixed
+seeds (`logs/exp_m3.log`).
+
+| model | params | held-out agree | fights | boss | Brier | act 1 | act 2 | win |
+|---|---|---|---|---|---|---|---|---|
+| r5 teachers | 9.1M | - | - | - | - | 0.766 | 0.260 | 0.048 |
+| wide d512 1/2/1 | 18.5M | 91.5% | 90.1% | 90.9% | 0.059 | 0.784 | 0.234 | 0.056 |
+| wide, adaptive loops | 18.5M | 91.6% | - | - | - | 0.774 | 0.250 | 0.046 |
+| deep d384 2/4/2 (no loops) | 18.1M | 91.6% | 90.1% | 90.7% | 0.061 | 0.759 | 0.237 | 0.057 |
+| small d256 2/2/2 | 7.0M | 91.3% | 89.8% | 90.7% | 0.072 | 0.800 | 0.238 | 0.044 |
+
+What it shows:
+
+- **One network replaces both of r5's**, at every size, with no loss of strength.
+- **Imitation cannot separate model sizes.** The teachers are 9M of small networks, so copying them
+  never stresses capacity; the spread is 0.3 points of agreement and all play results sit
+  within noise. The size decision moves to M4, where RL can use capacity the teachers lack.
+- **Loops add nothing to imitation** (91.5% at 1 pass, 91.4% at 4; adaptive averaged 1.7 loops
+  for the same play). That is expected: the teachers decide in one pass, so there is nothing
+  deeper to copy. Loops have to earn their cost under RL and search.
+- **The value head is not calibrated**: its Brier (0.059-0.072) is WORSE than always predicting
+  the 4.4% base rate (0.042). There are only ~90 winning runs, and ~390 decisions per run share
+  one outcome, so the head memorises runs. Win-only value needs bootstrapped targets (M4's
+  GAE/TD) and far more runs; E1 (calibration) is the capability most at risk.
+
+**Decision for M4:** keep the wide d512 1/2/1 as the default. It has the best-calibrated value
+among the configs trained with loops, and it keeps the loop capability. Run the 7M as a paired A/B
+in M4's first ~100 iterations, and pick by per-boss win rate and value calibration. The 7M is 2.4x
+faster per decision, which matters for search.
+
