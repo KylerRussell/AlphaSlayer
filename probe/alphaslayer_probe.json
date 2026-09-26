@@ -1,0 +1,11 @@
+{
+  "id": "alphaslayer_probe",
+  "name": "AlphaSlayer Probe",
+  "author": "kyler",
+  "description": "Headless feasibility probe: measures rules-engine throughput and state-snapshot cost for RL training. Read-only instrumentation; does not alter game rules.",
+  "version": "0.1.0",
+  "has_dll": true,
+  "has_pck": false,
+  "affects_gameplay": true,
+  "min_game_version": "0.111.0"
+}
