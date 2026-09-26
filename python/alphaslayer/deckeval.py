@@ -33,6 +33,9 @@ def _spec_payload(spec, room):
     frac = getattr(spec, "hp_frac", None)
     if frac is not None:
         payload["hp_frac"] = round(float(frac), 4)
+    enc = getattr(spec, "encounter", None)
+    if enc:
+        payload["encounter"] = enc
     return payload
 
 
@@ -141,11 +144,12 @@ class VecDeckEval:
         self.close()
 
     def evaluate(self, specs, policy, progress_every=0, on_terminal=None,
-                 with_idx=False):
+                 with_idx=False, on_start=None):
         """``with_idx`` passes a third argument to ``policy``: the env index each
         decision came from, which a trainer needs to group transitions into episodes.
         ``on_terminal(env_idx, spec, room, msg)`` fires as each fight ends, which is
-        where an episode's reward becomes known."""
+        where an episode's reward becomes known. ``on_start(env_idx, spec, room)`` fires
+        when a fight is handed to an env, before its first decision."""
         """Plays every spec's owed fights. ``policy(obs_list, legal_list) -> [action_idx]``."""
         work = []
         for s in specs:
@@ -283,6 +287,8 @@ class VecDeckEval:
                             if got is not None:
                                 spec, room = got
                                 assigned[conn.idx] = (spec, room)
+                                if on_start is not None:
+                                    on_start(conn.idx, spec, room)
                                 try:
                                     conn.sock.sendall((_json_line({
                                         **_spec_payload(spec, room)})).encode())
@@ -314,6 +320,10 @@ class VecDeckEval:
                                           flush=True)
                         elif t == "done":
                             conn.alive = False
+                        elif t == "error":
+                            # The server refused a spec (empty pool, unknown encounter). Loud:
+                            # ignoring it left the fight unplayed until the stall timeout.
+                            raise RuntimeError(f"deckserve env {conn.idx}: {msg.get('msg')}")
                     if not conn.alive:
                         # Put its fight back. A game that crashes mid-fight closes the socket,
                         # and leaving the assignment behind orphans work nothing can finish:

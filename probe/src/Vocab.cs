@@ -66,6 +66,25 @@ public static class Vocab
     /// </summary>
     private static IEnumerable<string> AllOrbIds() => AllModelIds<OrbModel>("Orb");
 
+    private static object[] ActPools()
+    {
+        try
+        {
+            return ActModel.GetDefaultList().Select(a => (object)new Dictionary<string, object>
+            {
+                ["act"] = a.Id.Entry,
+                ["regular"] = a.AllRegularEncounters.Select(e => e.Id.Entry).ToArray(),
+                ["elite"] = a.AllEliteEncounters.Select(e => e.Id.Entry).ToArray(),
+                ["boss"] = a.AllBossEncounters.Select(e => e.Id.Entry).ToArray(),
+            }).ToArray();
+        }
+        catch (Exception e)
+        {
+            Probe.Log($"act pools unavailable: {e.Message}");
+            return Array.Empty<object>();
+        }
+    }
+
     /// <summary>Id.Entry of every concrete T in the game, via the generic ModelDb accessor.</summary>
     private static IEnumerable<string> AllModelIds<T>(string accessor) where T : AbstractModel
     {
@@ -133,6 +152,10 @@ public static class Vocab
             ["cards"] = Cards, ["relics"] = Relics, ["powers"] = Powers,
             ["potions"] = Potions, ["monsters"] = Monsters, ["enchantments"] = Enchantments,
             ["afflictions"] = Afflictions, ["orbs"] = Orbs, ["encounters"] = Encounters,
+            // Each act's encounter pools, in act order: what the deck server can play when
+            // asked for a room in that act. A curriculum targets only encounters in these pools
+            // (an act's opening "weak" hallway fights are NOT in its regular pool).
+            ["act_pools"] = ActPools(),
             ["enums"] = new Dictionary<string, object>
             {
                 ["card_type"] = Enum.GetNames(typeof(MegaCrit.Sts2.Core.Entities.Cards.CardType)),

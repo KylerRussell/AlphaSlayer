@@ -134,7 +134,30 @@ public static class DeckServe
                 catch (Exception e) { Probe.Log($"  (non-fatal) set hp_frac: {e.Message}"); }
             }
 
-            var enc = await harness.BeginCombatAsync(pool[rng.Next(pool.Count)]);
+            // Optional targeting: "encounter" names one fight in the room's pool, so a curriculum
+            // can drill the bosses it loses instead of whatever the pool hands out. A name not
+            // in the pool is an error, never a silent substitution.
+            var wantEnc = ParseStr(spec, "encounter");
+            EncounterModel chosenEnc;
+            if (!string.IsNullOrEmpty(wantEnc))
+            {
+                chosenEnc = pool.FirstOrDefault(e => e.Id.Entry == wantEnc);
+                if (chosenEnc == null)
+                {
+                    await writer.WriteLineAsync(Probe.ToJsonCompact(new Dictionary<string, object>
+                    {
+                        ["t"] = "error",
+                        ["msg"] = $"encounter '{wantEnc}' is not in this act's '{room}' pool " +
+                                  $"({string.Join(",", pool.Select(e => e.Id.Entry))})",
+                    }));
+                    continue;
+                }
+            }
+            else
+            {
+                chosenEnc = pool[rng.Next(pool.Count)];
+            }
+            var enc = await harness.BeginCombatAsync(chosenEnc);
             RunManager.Instance.ActionExecutor.Unpause();
 
             var startHp = harness.Player.Creature.CurrentHp;

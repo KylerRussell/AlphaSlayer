@@ -202,7 +202,7 @@ GAE across the fight/run boundary; per-group averaging weights.
 | M1 | probe additions above | **DONE 2026-09-26.** Live delivery tests pass and fail on the old DLL; no vocab index moved; no game side effects |
 | M2 | encoder + model | **DONE 2026-09-26.** `alphaslayer/unified/`, `tests/test_unified.py`: 45 delivery checks (every M1 field changes the output), reference alignment, order invariance, batch isolation, loops; four reintroduced bugs all caught |
 | M3 | distillation | **DONE 2026-09-26, all configs pass.** 2,005 teacher runs (786k decisions). Every size matches r5 in play within noise (act 1 0.76-0.80 vs 0.766; win 0.044-0.057 vs 0.048) at 91.3-91.6% held-out agreement. Results below |
-| M4 | `train_unified.py` | win-only reward + aux heads; V(post) fight terminals; buffer-math tests; 50-iteration smoke run |
+| M4 | `train_unified.py` | **Built 2026-09-26; smoke run FAILED acceptance (drift, see below); stabilised variant running.** `alphaslayer/unified/ppo.py` (credit math), `alphaslayer/unified/curriculum.py`, `exp_m4.sh` (auto-resume). Tests: `test_unified_ppo.py` (exact returns/advantages, ratio = 1 with replayed loops), `test_unified_curriculum.py` (live: targeted bosses delivered, terminals = V(post) recomputed; bites on the pre-targeting probe) |
 | M5 | capability eval suite | every eval in `CAPABILITIES.md` runs on a checkpoint and on r5, with a report |
 | M6 | training round | per-boss, per-act and per-capability comparison against continuing r5, on paired seeds |
 | M7 | determinism race fix | the "mix" side-effect set recorded 5 times is identical every time |
@@ -246,4 +246,103 @@ What it shows:
 among the configs trained with loops, and it keeps the loop capability. Run the 7M as a paired A/B
 in M4's first ~100 iterations, and pick by per-boss win rate and value calibration. The 7M is 2.4x
 faster per decision, which matters for search.
+
+## M4 as built (2026-09-26)
+
+- **Credit** (`alphaslayer/unified/ppo.py`): win-only reward; gamma per floor (default 1, so
+  V = P(win)); GAE(lambda=0.95) per decision over the interleaved run; potential shaping (combat
+  hp swing, run hp) in the ADVANTAGE only, so value targets stay probabilities. A measured
+  consequence of GAE: a better post-fight value credits a fight's last decision by exactly
+  (1 - lambda) x the gap, with the rest coming from realised outcomes. Lambda is the knob for how
+  much fights lean on the value head.
+- **PPO**: loop counts recorded per decision and replayed (`loop_rows`), so the ratio is exactly 1
+  before the first update (tested to 1e-17); the loss upcasts only bf16/fp16. Combat and run
+  halves weighted equally, and advantages normalised per half. KL to the distilled anchor
+  anneals to 0 over 100 iterations.
+- **Curriculum** (`alphaslayer/unified/curriculum.py`, `--curriculum-every N`): isolated act-2/3
+  fights on decks harvested from the model's own runs, at their real entry HP.
+  - Targets are chosen by per-encounter loss rate (an EMA over in-run and curriculum fights).
+    DeckServe now takes an `encounter` field, and an encounter outside the pool is a loud error.
+  - A won fight ends at V(post-fight state): the harvested run state with the HP the fight
+    left, scored by the model's value head. A lost fight ends at 0. This is the same objective
+    as in-run fights.
+  - The deck server's synthetic run context (floor, boss, character, gold) is replaced with the
+    harvested run's before the model sees it.
+- **Ops**: a checkpoint every iteration; `exp_m4.sh` resumes after crashes; harvest appends to
+  `<out>.harvest.jsonl`.
+
+### M4 smoke run (2026-09-26): PPO drifts, it does not learn
+
+50 iterations x 48 runs from the distilled d512 (`logs/m4_smoke.log`), in 10-iteration blocks:
+
+| iters | act 1 | act 2 | win | entropy | KL to anchor |
+|---|---|---|---|---|---|
+| 1-10 | 0.661 | 0.171 | 0.034 | 0.60 | 0.026 |
+| 21-30 | 0.574 | 0.132 | 0.021 | 0.66 | 0.098 |
+| 41-50 | 0.515 | 0.105 | 0.011 | 0.69 | 0.132 |
+
+Entropy and KL rise while play falls: a random walk. The win-only signal is nearly pure noise at
+1-4% wins, and the value head is no better than the base rate (Brier ~ base in every block), so
+the advantages cannot rank decisions, while the entropy bonus pushes steadily toward randomness.
+(The absolute gap to M3's 0.78 act-1 is partly sampling: training rollouts sample fights; the
+evaluation is greedy.) One learned behaviour showed up anyway: the potion gate went from allow
+98% to 73%.
+
+Next, in order:
+1. Stabilise: entropy 0.01 -> 0.001, and hold the anchor KL at 0.1 (run `stab`, paired seeds).
+2. If the decline persists, add dense credit that keeps the win-only optimum: potential-based
+   act-progress shaping (invariant at gamma = 1 with a zero terminal potential).
+
+### Stabilised run and head calibration (2026-09-26)
+
+`stab` (entropy 0.001, anchor KL held at 0.1; `logs/m4_stab.log`) declined less but still
+declined: act-1 went 0.674 -> 0.608 half over half (-0.066 +- 0.020), against the smoke run's
+-0.103. The entropy bonus was part of the drift, not the root.
+
+Held-out calibration of the distilled model's heads (30k decisions from held-out M3 runs):
+
+| head | base rate | Brier skill vs base | AUC |
+|---|---|---|---|
+| P(win) | 0.044 | -0.43 | 0.62 |
+| act 1 cleared | 0.779 | -0.41 | 0.64 |
+| act 2 cleared | 0.321 | -0.25 | 0.73 |
+| reach act 3 | 0.325 | -0.07 | 0.76 |
+| this fight won | 0.890 | **+0.21** | **0.91** |
+
+Every RUN-outcome head is worse than predicting its base rate, including act-1 clear with 78%
+positives. So it is not the rarity of wins: it is run-level overfitting. ~1,800 training runs,
+~390 decisions per run sharing one label, and near-unique decks mean the heads memorise runs. The
+PER-FIGHT head (about 20 labels per run) genuinely generalises.
+
+Consequence for credit: with lambda = 0.95 a decision 100 steps from the end of its run gets the
+realised outcome with weight ~0.006. Its advantage is almost entirely the value head's own
+step-to-step changes, and that head is overfit and overconfident. The policy is steered by
+value noise. The test is the `mc` run: lambda = 1, so advantages = realised outcome - V, and the
+value head acts only as a baseline.
+
+Directions this opens (E1 in CAPABILITIES.md is the capability at stake):
+- Value regularisation and decorrelation: train run-outcome heads on a per-run subsample,
+  dropout/weight decay on those heads, and track held-out skill online. Gate the use of V on
+  positive skill.
+- Dense credit from what IS predictable: potential shaping from P(win this fight), which has
+  real skill, inside fights.
+- Data: RL accumulates about 48 runs per iteration, so run-level heads see about 10x the M3
+  runs within 400 iterations.
+
+### Three runs, one conclusion (2026-09-26)
+
+| run | change | act 1 half-over-half | win |
+|---|---|---|---|
+| smoke | lambda 0.95, entropy 0.01, anchor fading | -0.103 +- 0.020 | 0.034 -> 0.014 |
+| stab | entropy 0.001, anchor held at 0.1 | -0.066 +- 0.020 | 0.049 -> 0.039 |
+| mc | + lambda = 1 (no value bootstrap) | -0.044 +- 0.020 | 0.039 -> 0.024 |
+
+Each fix cut the damage; none made the policy learn. At a 2-4% win rate, 48 runs per iteration
+carry 1-2 wins, which is too little information to rank ~18k decisions, so the policy
+random-walks and the anchor only slows it. r5 learned because its rewards were dense.
+
+**Decision (Kyler, 2026-09-26): potential-based shaping.** Win-only stays the true objective. Credit
+is densified with potentials, which provably leave the optimal policy unchanged at gamma = 1:
+acts cleared so far, plus the per-fight win head (the one head with held-out skill). The value
+head is not bootstrapped until its held-out skill turns positive.
 

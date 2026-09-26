@@ -102,6 +102,18 @@ class Vocab:
         self.sizes = dict(vocab_json["sizes"])
         rt = vocab_json.get("enums", {}).get("room_type", [])
         self.room_ix = {name: i for i, name in enumerate(rt)}
+        # The probe dumps tables as "[NAME, INDEX]" strings.
+        # (act index, room) -> encounters the deck server can play there ("regular", "elite",
+        # "boss"). Empty when the vocab predates the dump.
+        self.act_pools = {}
+        for i, a in enumerate(vocab_json.get("act_pools", [])):
+            for room in ("regular", "elite", "boss"):
+                self.act_pools[(i, room)] = set(a.get(room, []))
+        self.enc_ix = {}
+        for e in vocab_json.get("encounters", []):
+            name, _, ix = str(e).strip("[]").rpartition(", ")
+            if name and ix.isdigit():
+                self.enc_ix[name] = int(ix)
 
 
 # ---- per-entity row builders --------------------------------------------------------------

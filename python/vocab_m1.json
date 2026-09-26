@@ -1532,6 +1532,84 @@
     "[VINE_SHAMBLER_NORMAL, 84]",
     "[WATERFALL_GIANT_BOSS, 85]"
   ],
+  "act_pools": [
+    {
+      "act": "OVERGROWTH",
+      "regular": [
+        "CUBEX_CONSTRUCT_NORMAL",
+        "FLYCONID_NORMAL",
+        "FOGMOG_NORMAL",
+        "INKLETS_NORMAL",
+        "MAWLER_NORMAL",
+        "NIBBITS_NORMAL",
+        "OVERGROWTH_CRAWLERS",
+        "RUBY_RAIDERS_NORMAL",
+        "SLIMES_NORMAL",
+        "SLITHERING_STRANGLER_NORMAL",
+        "SNAPPING_JAXFRUIT_NORMAL",
+        "VINE_SHAMBLER_NORMAL"
+      ],
+      "elite": [
+        "BYGONE_EFFIGY_ELITE",
+        "BYRDONIS_ELITE",
+        "PHROG_PARASITE_ELITE"
+      ],
+      "boss": [
+        "CEREMONIAL_BEAST_BOSS",
+        "THE_KIN_BOSS",
+        "VANTOM_BOSS"
+      ]
+    },
+    {
+      "act": "HIVE",
+      "regular": [
+        "BOWLBUGS_NORMAL",
+        "CHOMPERS_NORMAL",
+        "EXOSKELETONS_NORMAL",
+        "HUNTER_KILLER_NORMAL",
+        "LOUSE_PROGENITOR_NORMAL",
+        "MYTES_NORMAL",
+        "OVICOPTER_NORMAL",
+        "SLUMBERING_BEETLE_NORMAL",
+        "SPINY_TOAD_NORMAL",
+        "THE_OBSCURA_NORMAL"
+      ],
+      "elite": [
+        "DECIMILLIPEDE_ELITE",
+        "ENTOMANCER_ELITE",
+        "INFESTED_PRISMS_ELITE"
+      ],
+      "boss": [
+        "KAISER_CRAB_BOSS",
+        "KNOWLEDGE_DEMON_BOSS",
+        "THE_INSATIABLE_BOSS"
+      ]
+    },
+    {
+      "act": "GLORY",
+      "regular": [
+        "AXEBOTS_NORMAL",
+        "CONSTRUCT_MENAGERIE_NORMAL",
+        "FABRICATOR_NORMAL",
+        "FROG_KNIGHT_NORMAL",
+        "GLOBE_HEAD_NORMAL",
+        "OWL_MAGISTRATE_NORMAL",
+        "SCROLLS_OF_BITING_NORMAL",
+        "SLIMED_BERSERKER_NORMAL",
+        "THE_LOST_AND_FORGOTTEN_NORMAL"
+      ],
+      "elite": [
+        "KNIGHTS_ELITE",
+        "MECHA_KNIGHT_ELITE",
+        "SOUL_NEXUS_ELITE"
+      ],
+      "boss": [
+        "AEONGLASS_BOSS",
+        "QUEEN_BOSS",
+        "TEST_SUBJECT_BOSS"
+      ]
+    }
+  ],
   "enums": {
     "card_type": [
       "None",
