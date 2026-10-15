@@ -14,12 +14,33 @@ Credit, in one place:
   * DISCOUNT per FLOOR, not per decision: the factor between consecutive decisions is
     gamma ** (floors advanced). A fight's ~25 decisions share one floor, so they are not
     discounted against each other. gamma = 1 by default; the flag exists for experiments.
-  * SHAPING goes into the ADVANTAGE ONLY, never into the value target. The potentials are
-    phi = w_combat * (player hp% - mean enemy hp%) on fight decisions and w_hp * hp% on run
-    decisions, zero at the terminal. Potential-based terms telescope, so they move credit to the
-    decision that caused an HP swing without changing which policy is optimal, and the value
-    head stays a clean P(win).
-  * GAE(lambda) per decision, over the whole run.
+  * SHAPING goes into the ADVANTAGE ONLY, never into the value target. phi(s), zero at the
+    terminal, behaves like a crude value estimate:
+        run decision:    phi_run = w_act * (act + 1) + w_hp * hp%
+        fight decision:  phi = (1 - w_fight * (1 - P(win this fight))) * phi_run
+    With w_fight = 1 a fight is worth P(win it) times the run state behind it. That makes phi
+    CONTINUOUS across fight boundaries: winning a fight (P -> 1) hands over phi_run unchanged,
+    entering one costs (1 - P) * phi_run (its expected risk), and dying (P -> 0) meets the
+    terminal 0. With w_act = 1/3, phi_run reaches ~1 at act 3, matching the win reward.
+
+    Continuity matters because of lambda. Potential terms telescope over a whole return, so at
+    gamma = 1 they leave the optimal policy unchanged (Ng et al. 1999). But a lambda < 1
+    advantage with V = 0 equals -phi(s_t) plus (1 - lambda) times a lambda-weighted average of
+    FUTURE potentials, so the policy is pushed toward high average potential over the next
+    ~1/(1-lambda) decisions. An additive fight term (the first version) DROPPED at the end of every
+    won fight, which paid the policy to prolong fights: entropy rose and act-2 clears fell in
+    the `shaped` run. With continuous potentials, finishing sooner costs nothing.
+  * BOOTSTRAPPING is optional. M4's first runs showed the run-outcome heads have NEGATIVE
+    held-out skill (they memorise runs), and bootstrapping from them feeds value noise into
+    every advantage. With bootstrap=False, advantages use V = 0 (lambda-discounted shaped credit
+    plus the outcome) and value targets are the realised outcome. The trainer switches
+    bootstrapping on only once the value head shows skill on runs it has not seen.
+  * GAE with lambda per FLOOR, like gamma. The trace decays by lambda ** (floors advanced), so
+    the decisions of one fight (one floor) share credit undecayed. Decaying per DECISION acts
+    as a hidden discount on decision count once V = 0: it made a longer fight look better
+    whenever the future held a loss, which most runs do, and so it paid the policy to stall.
+    Per floor, within a fight the credit is the fight's actual outcome, with the in-fight
+    potential as a state baseline; across floors it decays and bootstraps.
 """
 from __future__ import annotations
 
@@ -45,6 +66,7 @@ class Step:
     loop: int                       # loop count used at rollout (replayed in the update)
     floor: int
     phi: float = 0.0                # shaping potential of this state
+    p_fight: float | None = None    # P(win this fight) from the model's head (fight decisions)
     # filled in when known
     fight_won: int = -1
     fight_hp: float = float("nan")
@@ -54,21 +76,27 @@ class Step:
     reach_act3: int = -1
     floors_left: float = float("nan")
     adv: float = 0.0                # shaped GAE advantage (policy)
-    ret: float = 0.0                # unshaped lambda-return (value target)
+    ret: float = 0.0                # unshaped lambda-return (value target); NaN = unknown
     act: int = 0
 
 
-def potential(kind: str, obs: dict, w_combat: float, w_hp: float) -> float:
-    """phi(s): combat = w_combat*(player hp% - mean living enemy hp%); run = w_hp*hp%."""
-    if kind == "combat":
-        p = obs.get("player", {})
-        php = (p.get("hp", 0) or 0) / max(1, p.get("max_hp", 1) or 1)
+def potential(kind: str, obs: dict, w_combat: float, w_hp: float, w_act: float = 0.0,
+              w_fight: float = 0.0, p_fight: float | None = None) -> float:
+    """phi(s); see the module docstring. ``w_combat`` adds the old (player hp% - enemy hp%)
+    term inside fights. It is NOT continuous across fight boundaries, so it defaults off."""
+    p = obs.get("player", obs) if kind != "combat" else obs.get("player", {})
+    hp = (p.get("hp", 0) or 0) / max(1, p.get("max_hp", 1) or 1)
+    phi_run = w_act * (act_of(kind, obs) + 1) + w_hp * hp
+    if kind != "combat":
+        return phi_run
+    pw = 1.0 if p_fight is None else float(p_fight)
+    phi = (1.0 - w_fight * (1.0 - pw)) * phi_run
+    if w_combat:
         alive = [e for e in (obs.get("enemies") or []) if e.get("alive")]
         ehp = (sum((e.get("hp", 0) or 0) / max(1, e.get("max_hp", 1) or 1) for e in alive)
                / len(alive)) if alive else 0.0
-        return w_combat * (php - ehp)
-    p = obs.get("player", obs)
-    return w_hp * (p.get("hp", 0) or 0) / max(1, p.get("max_hp", 1) or 1)
+        phi += w_combat * (hp - ehp)
+    return phi
 
 
 def floor_of(kind: str, obs: dict) -> int:
@@ -82,51 +110,87 @@ def act_of(kind: str, obs: dict) -> int:
 
 
 def compute_targets(steps: list, won: bool, gamma: float = 1.0, lam: float = 0.95,
-                    v_end: float = 0.0) -> None:
-    """Fills adv (shaped, for the policy) and ret (unshaped lambda-return, for the value head).
+                    v_end: float = 0.0, phi_end: float = 0.0, bootstrap: bool = True,
+                    mc_end: float | None = 0.0) -> None:
+    """Fills adv (shaped, for the policy) and ret (value target).
 
-    Reward is 1 on the last step of a won run, else 0. After the last step the value is
-    ``v_end`` and the potential is 0. For a whole run v_end is 0: the run is over. For an
-    ISOLATED curriculum fight that was won, v_end is the value of the post-fight run state, so the
-    fight is credited exactly as it would be inside a run. A lost fight ends the run: v_end = 0.
+    Reward is 1 on the last step of a won run, else 0. After the last step the potential is
+    ``phi_end`` (0 when the run is over) and the value is ``v_end`` (0 when the run is over).
+    For an ISOLATED curriculum fight that was won, both describe the post-fight run state, so
+    the fight is credited exactly as it would be inside a run; a lost fight ends the run (0, 0).
+
+    bootstrap=True: GAE against the value head; ret is the unshaped lambda-return.
+    bootstrap=False: the value head is not used (V = 0 in every TD error), so advantages are
+    lambda-discounted shaped credit plus the outcome. ret is the realised return plus
+    ``mc_end`` (0 for a finished run; None when unknown, as in an isolated fight, giving NaN).
     """
     T = len(steps)
     if T == 0:
         return
     a_sh = a_un = 0.0
+    g = None if mc_end is None else float(mc_end)
     for t in reversed(range(T)):
         s = steps[t]
         last = t == T - 1
         r = float(won) if last else 0.0
         if last:
-            d, v_next, phi_next = 1.0, float(v_end), 0.0
+            d, phi_next = 1.0, float(phi_end)
+            v_next = float(v_end) if bootstrap else 0.0
         else:
             nxt = steps[t + 1]
-            d = gamma ** max(0, nxt.floor - s.floor)
-            v_next, phi_next = nxt.v, nxt.phi
-        delta_un = r + d * v_next - s.v
+            k = max(0, nxt.floor - s.floor)
+            d = gamma ** k
+            phi_next = nxt.phi
+            v_next = nxt.v if bootstrap else 0.0
+        # lambda decays per floor advanced, not per decision (see the module docstring).
+        lk = 1.0 if last else (lam ** k if k > 0 else 1.0)
+        v_here = s.v if bootstrap else 0.0
+        delta_un = r + d * v_next - v_here
         delta_sh = delta_un + (d * phi_next - s.phi)
-        a_un = delta_un + d * lam * a_un
-        a_sh = delta_sh + d * lam * a_sh
+        a_un = delta_un + d * lk * a_un
+        a_sh = delta_sh + d * lk * a_sh
         s.adv = a_sh
-        s.ret = min(1.0, max(0.0, a_un + s.v))
+        if bootstrap:
+            s.ret = min(1.0, max(0.0, a_un + s.v))
+        else:
+            g = None if g is None else r + d * g
+            s.ret = float("nan") if g is None else min(1.0, max(0.0, g))
+
+
+def value_skill(steps: list):
+    """(brier, base brier, skill) of the rollout value predictions against the run outcomes.
+
+    Rollout values were predicted BEFORE these runs' outcomes existed, so this is an honest
+    out-of-sample measure. skill = 1 - brier/base: 0 means no better than predicting the base
+    rate, and negative means worse.
+    """
+    ys = np.array([s.won for s in steps if s.won >= 0], np.float64)
+    vs = np.array([s.v for s in steps if s.won >= 0], np.float64)
+    if len(ys) == 0:
+        return float("nan"), float("nan"), float("nan")
+    brier = float(((vs - ys) ** 2).mean())
+    base = float(((ys.mean() - ys) ** 2).mean())
+    return brier, base, (1.0 - brier / base) if base > 0 else float("nan")
 
 
 class RunBuffer:
     """Per-env open runs; closed runs become training steps with every target filled."""
 
-    def __init__(self, gamma=1.0, lam=0.95, w_combat=0.0, w_hp=0.0):
+    def __init__(self, gamma=1.0, lam=0.95, w_combat=0.0, w_hp=0.0, w_act=0.0, w_fight=0.0,
+                 bootstrap=True):
         self.gamma, self.lam = gamma, lam
-        self.w_combat, self.w_hp = w_combat, w_hp
+        self.w_combat, self.w_hp, self.w_act, self.w_fight = w_combat, w_hp, w_act, w_fight
+        self.bootstrap = bootstrap
         self.open: dict[int, list] = {}
         self.fight_open: dict[int, list] = {}
         self.done: list[Step] = []
         self.runs: list[dict] = []
 
-    def add(self, env, kind, obs, legal, a, logp, v, loop):
+    def add(self, env, kind, obs, legal, a, logp, v, loop, p_fight=None):
         st = Step(kind=kind, obs=obs, legal=legal, a=a, logp=logp, v=v, loop=loop,
-                  floor=floor_of(kind, obs), act=act_of(kind, obs),
-                  phi=potential(kind, obs, self.w_combat, self.w_hp))
+                  floor=floor_of(kind, obs), act=act_of(kind, obs), p_fight=p_fight,
+                  phi=potential(kind, obs, self.w_combat, self.w_hp, self.w_act,
+                                self.w_fight, p_fight))
         self.open.setdefault(env, []).append(st)
         if kind == "combat":
             self.fight_open.setdefault(env, []).append(st)
@@ -148,7 +212,7 @@ class RunBuffer:
             st.act_clear = int(won or act_reached > st.act)
             st.reach_act3 = int(won or act_reached >= 2)
             st.floors_left = float(max(0, floors - st.floor))
-        compute_targets(steps, won, self.gamma, self.lam)
+        compute_targets(steps, won, self.gamma, self.lam, bootstrap=self.bootstrap)
         self.done.extend(steps)
         self.runs.append({"won": int(won), "act": act_reached, "floors": floors,
                           "n": len(steps)})
@@ -167,13 +231,30 @@ def _hi(x: torch.Tensor) -> torch.Tensor:
     return x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
 
 
-def group_mean(per_row: torch.Tensor, kind: torch.Tensor, run_weight: float = 0.5):
-    """Combat rows and run rows count equally; each run decision kind counts equally within the
-    run half. Combat is ~80% of decisions and a flat mean would let it own the gradient."""
+def group_mean(per_row: torch.Tensor, kind: torch.Tensor, run_weight: float = 0.5,
+               kind_weight: str = "equal"):
+    """Combat rows and run rows count equally (combat is ~80% of decisions). Within the run half:
+
+      equal  each decision kind counts equally (r5's per-kind loss). shaped3 showed the cost:
+             a campfire (~5% of steps) pulls as hard as all travel, so with noisy advantages the
+             rare kinds random-walk (rest entropy 0.00 -> 0.52 with its top action unchanged)
+      flat   each DECISION counts equally: standard PPO; a kind's gradient, and its noise, scale
+             with how often it occurs
+      sqrt   kinds weighted by sqrt(count): in between
+    """
     is_c = kind == COMBAT
     c = per_row[is_c].mean() if is_c.any() else None
-    runs = [per_row[kind == k].mean() for k in kind.unique().tolist() if k != COMBAT]
-    r = torch.stack(runs).mean() if runs else None
+    ks = [k for k in kind.unique().tolist() if k != COMBAT]
+    r = None
+    if ks:
+        means = torch.stack([per_row[kind == k].mean() for k in ks])
+        if kind_weight == "equal":
+            r = means.mean()
+        else:
+            n = torch.tensor([float((kind == k).sum()) for k in ks], device=per_row.device,
+                             dtype=means.dtype)
+            w = n if kind_weight == "flat" else n.sqrt()
+            r = (means * w).sum() / w.sum()
     if c is not None and r is not None:
         return (1 - run_weight) * c + run_weight * r
     return c if c is not None else (r if r is not None else per_row.sum() * 0)
@@ -181,7 +262,8 @@ def group_mean(per_row: torch.Tensor, kind: torch.Tensor, run_weight: float = 0.
 
 def ppo_loss(out: dict, tgt: dict, clip: float = 0.2, ent_coef: float = 0.01,
              vf_coef: float = 0.5, aux_coef: float = 0.25, run_weight: float = 0.5,
-             anchor_logp: torch.Tensor | None = None, kl_coef: float = 0.0):
+             anchor_logp: torch.Tensor | None = None, kl_coef: float = 0.0,
+             kind_weight: str = "equal"):
     """PPO clipped surrogate + value BCE + aux + optional KL toward an anchor policy.
 
     tgt: a (B,) chosen action, old_logp (B,), adv (B,) already normalised, ret (B,) in [0,1],
@@ -195,13 +277,19 @@ def ppo_loss(out: dict, tgt: dict, clip: float = 0.2, ent_coef: float = 0.01,
     s1 = ratio * tgt["adv"]
     s2 = ratio.clamp(1 - clip, 1 + clip) * tgt["adv"]
     kind = tgt["kind"]
-    zero = logits.sum() * 0
+    # A zero that stays in the graph. NOT logits.sum()*0: the logits hold the padding mask value
+    # (finfo.min/4), whose sum overflows to -inf, and -inf*0 = NaN. Every term that fell back to
+    # it (no value targets, no fight rows, no aux labels) then turned the loss NaN, and the
+    # trainer's finite-gradient guard silently skipped the update.
+    zero = _hi(out["value_logit"]).sum() * 0
     parts = {}
-    parts["pg"] = group_mean(-torch.min(s1, s2), kind, run_weight)
+    parts["pg"] = group_mean(-torch.min(s1, s2), kind, run_weight, kind_weight)
     p = logp_all.exp()
     ent = -(p * logp_all).masked_fill(~mask, 0.0).sum(-1)
-    parts["ent"] = group_mean(ent, kind, run_weight)
-    parts["value"] = F.binary_cross_entropy_with_logits(_hi(out["value_logit"]), tgt["ret"])
+    parts["ent"] = group_mean(ent, kind, run_weight, kind_weight)
+    vm = ~torch.isnan(tgt["ret"])        # unknown value targets (isolated fights, no bootstrap)
+    parts["value"] = (F.binary_cross_entropy_with_logits(_hi(out["value_logit"])[vm], tgt["ret"][vm])
+                      if vm.any() else zero)
     aux = out["aux"]
     # Run-level labels are absent (-1 / NaN) on isolated curriculum fights; mask them.
     def bce(head, lab):
@@ -222,7 +310,7 @@ def ppo_loss(out: dict, tgt: dict, clip: float = 0.2, ent_coef: float = 0.01,
     if anchor_logp is not None and kl_coef > 0:
         pa = anchor_logp.exp()
         kl = (pa * (anchor_logp - logp_all)).masked_fill(~mask, 0.0).sum(-1)
-        parts["kl"] = group_mean(kl, kind, run_weight)
+        parts["kl"] = group_mean(kl, kind, run_weight, kind_weight)
     total = (parts["pg"] - ent_coef * parts["ent"] + vf_coef * parts["value"]
              + aux_coef * sum(parts[k] for k in ("act_clear", "reach_act3", "floors_left",
                                                  "fight_win", "fight_hp"))

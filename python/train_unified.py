@@ -71,10 +71,30 @@ def main():
     ap.add_argument("--kl-coef", type=float, default=0.1, help="KL toward the anchor at iter 1")
     ap.add_argument("--kl-anneal", type=int, default=100, help="iterations for the KL to reach 0")
     ap.add_argument("--gamma", type=float, default=1.0, help="discount PER FLOOR")
-    ap.add_argument("--lam", type=float, default=0.95)
-    ap.add_argument("--w-combat", type=float, default=0.1, help="combat potential shaping weight")
-    ap.add_argument("--w-hp", type=float, default=0.1, help="run hp potential shaping weight")
+    ap.add_argument("--lam", type=float, default=0.8,
+                    help="GAE lambda PER FLOOR (credit horizon ~1/(1-lambda) floors)")
+    ap.add_argument("--w-combat", type=float, default=0.0,
+                    help="old (player hp%% - enemy hp%%) fight term; not continuous at fight "
+                         "boundaries, so off by default")
+    ap.add_argument("--w-hp", type=float, default=0.1, help="hp%% in the run potential")
+    ap.add_argument("--w-act", type=float, default=1 / 3,
+                    help="run potential per act (act+1): ~1 at act 3, matching the win reward")
+    ap.add_argument("--w-fight", type=float, default=1.0,
+                    help="fight potential = (1 - w*(1 - P(win this fight))) * run potential; "
+                         "1 = fully multiplicative, continuous at fight boundaries")
+    ap.add_argument("--bootstrap", default="auto", choices=["auto", "on", "off"],
+                    help="use the value head in GAE. auto: only once its out-of-sample skill "
+                         "(EMA over iterations) is positive; before that, V = 0 in every TD error")
+    ap.add_argument("--skill-ema", type=float, default=0.2)
+    ap.add_argument("--skill-min-iters", type=int, default=8,
+                    help="iterations with a measurable skill before auto-bootstrap may switch on")
+    ap.add_argument("--skill-threshold", type=float, default=0.05,
+                    help="EMA skill that switches auto-bootstrap on. One lucky 48-run batch "
+                         "(skill +0.49) pushed a 0 threshold over in shaped2")
     ap.add_argument("--run-weight", type=float, default=0.5)
+    ap.add_argument("--kind-weight", default="flat", choices=["equal", "flat", "sqrt"],
+                    help="weighting of run decision kinds within the run half of the loss; "
+                         "'equal' let rare kinds random-walk in shaped3 (see ppo.group_mean)")
     ap.add_argument("--loop-policy", default="1", help="'1'..'4' fixed, or 'adaptive'")
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--seed-prefix", default="U4_")
@@ -123,6 +143,9 @@ def main():
     cur_acts = tuple(int(x) for x in a.curriculum_acts.split(",") if x.strip())
     cur_mix = tuple(float(x) for x in a.curriculum_mix.split(","))
 
+    skill_ema = None          # EMA of the value head's out-of-sample Brier skill
+    skill_n = 0               # iterations that produced a measurable skill
+
     def act_policy(kinds, obs, legal, idxs, buf):
         b = to_torch(FT.encode_batch(list(zip(kinds, obs, legal)), vocab), dev)
         net.eval()
@@ -135,12 +158,15 @@ def main():
                 ks = choose_loops(traj, b["cand_mask"], cap)
                 logits = torch.stack([traj[int(k) - 1]["logits"][j] for j, k in enumerate(ks)])
                 values = torch.stack([traj[int(k) - 1]["value"][j] for j, k in enumerate(ks)])
+                pfight = torch.stack([traj[int(k) - 1]["aux"]["fight_win"][j] for j, k in enumerate(ks)])
             else:
                 k = int(a.loop_policy)
                 out = net(b, loop=k)
                 logits, values = out["logits"], out["value"]
+                pfight = out["aux"]["fight_win"]
                 ks = torch.full((len(kinds),), k)
         logits = logits.float()
+        pfight = torch.sigmoid(pfight.float())
         acts = []
         for j, kind in enumerate(kinds):
             if kind != "combat":
@@ -149,13 +175,17 @@ def main():
             lp = F.log_softmax(logits[j, :n], -1)
             act = int(torch.multinomial(lp.exp(), 1))
             buf.add(idxs[j], kind, obs[j], legal[j], act, float(lp[act]), float(values[j]),
-                    int(ks[j]))
+                    int(ks[j]), p_fight=float(pfight[j]) if kind == "combat" else None)
             acts.append(act)
         return acts
 
     for it in range(start, a.iters + 1):
         t0 = time.time()
-        buf = P.RunBuffer(gamma=a.gamma, lam=a.lam, w_combat=a.w_combat, w_hp=a.w_hp)
+        bootstrap = (a.bootstrap == "on"
+                     or (a.bootstrap == "auto" and skill_ema is not None
+                         and skill_n >= a.skill_min_iters and skill_ema >= a.skill_threshold))
+        buf = P.RunBuffer(gamma=a.gamma, lam=a.lam, w_combat=a.w_combat, w_hp=a.w_hp,
+                          w_act=a.w_act, w_fight=a.w_fight, bootstrap=bootstrap)
         fights = []
         boss = collections.defaultdict(lambda: [0, 0])
         deaths = collections.Counter()
@@ -198,6 +228,13 @@ def main():
         buf.drop_open()
         steps = buf.done
         collect_s = time.time() - t0
+        # Out-of-sample skill of the value head: these values were predicted before these runs'
+        # outcomes existed. It gates bootstrapping for the NEXT iteration.
+        _, _, skill = P.value_skill(steps)
+        if skill == skill:                       # not NaN (needs both outcomes present)
+            skill_n += 1
+            skill_ema = skill if skill_ema is None else (
+                (1 - a.skill_ema) * skill_ema + a.skill_ema * skill)
         if new_harvest:
             with open(harvest_path, "a") as fh:
                 for r in new_harvest:
@@ -222,8 +259,10 @@ def main():
                                              seed=f"UCUR{act}_{it}_",
                                              out_dir=f"/tmp/alphaslayer_ucur{act}_",
                                              act=act, stall_timeout=90.0)
-                c_steps, c_res = CU.play_fights(net, pools, picks, vocab, vocab.enc_ix, dev,
-                                                bf16=a.bf16)
+                c_steps, c_res = CU.play_fights(
+                    net, pools, picks, vocab, vocab.enc_ix, dev, bf16=a.bf16,
+                    credit=dict(w_combat=a.w_combat, w_hp=a.w_hp, w_act=a.w_act,
+                                w_fight=a.w_fight, lam=a.lam, bootstrap=bootstrap))
             finally:
                 for pl_ in pools.values():
                     try:
@@ -248,6 +287,16 @@ def main():
         t1 = time.time()
         packed = DS.Packed(DS.pack([{"kind": s.kind, "obs": s.obs, "legal": s.legal} for s in steps], vocab))
         adv = P.normalise_advantages(steps)
+        # Per-kind advantage means. Normalisation centres each HALF (fight / run), but the loss
+        # averages per KIND, so a kind whose advantages are systematically negative pushes
+        # probability away from whatever it sampled, and its entropy rises. Logged every
+        # iteration so that bias is visible.
+        kadv = collections.defaultdict(list)
+        for s_, an in zip(steps, adv):
+            kadv[s_.kind].append((s_.adv, float(an)))
+        adv_line = " ".join(
+            f"{k}:{np.mean([x for x, _ in v]):+.3f}/{np.mean([y for _, y in v]):+.2f}"
+            for k, v in sorted(kadv.items(), key=lambda kv: -len(kv[1])))
         arr = lambda f, dt=np.float32: np.array([f(s) for s in steps], dt)
         T_ = {"a": arr(lambda s: s.a, np.int64), "old_logp": arr(lambda s: s.logp),
               "adv": adv, "ret": arr(lambda s: s.ret),
@@ -284,7 +333,7 @@ def main():
                 total, parts = P.ppo_loss(out, tgt, clip=a.clip, ent_coef=a.ent_coef,
                                           vf_coef=a.vf_coef, aux_coef=a.aux_coef,
                                           run_weight=a.run_weight, anchor_logp=anchor_logp,
-                                          kl_coef=kl_coef)
+                                          kl_coef=kl_coef, kind_weight=a.kind_weight)
                 opt.zero_grad(set_to_none=True)
                 total.backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
@@ -301,9 +350,13 @@ def main():
         a1 = sum(1 for r in results if r.act >= 1 or r.won) / max(1, n)
         a2 = sum(1 for r in results if r.act >= 2 or r.won) / max(1, n)
         fw = sum(f.won for f in fights) / max(1, len(fights))
-        v = np.array([s.v for s in steps]); y = np.array([s.won for s in steps], float)
-        brier = float(((v - y) ** 2).mean())
-        base = float(((y.mean() - y) ** 2).mean())
+        # Only decisions whose run outcome is known (curriculum fights have none).
+        brier, base, _ = P.value_skill(steps)
+        # Delivery check for the shaping: every fight decision should carry P(win this fight),
+        # and the potentials should be non-zero when their weights are.
+        cs = [s for s in steps if s.kind == "combat"]
+        pf_cover = sum(1 for s in cs if s.p_fight is not None) / max(1, len(cs))
+        phi_mean = float(np.mean([s.phi for s in steps])) if steps else 0.0
         kstat = collections.defaultdict(lambda: [0, collections.Counter()])
         for s in steps:
             if s.kind == "combat":
@@ -322,8 +375,11 @@ def main():
               f"fight_win={fw:.3f} | pg={agg['pg'] / nb:+.4f} ent={agg['ent'] / nb:.3f} "
               f"vf={agg['value'] / nb:.4f} kl_anchor={agg['kl'] / nb:.4f}(x{kl_coef:.3f}) "
               f"clip={agg['clipfrac'] / nb:.3f} akl={agg['approx_kl'] / nb:+.4f} | "
-              f"brier={brier:.4f}/base {base:.4f} loops={loops:.2f} steps={len(steps)} "
+              f"brier={brier:.4f}/base {base:.4f} skill={skill:+.3f} ema={skill_ema if skill_ema is not None else float('nan'):+.3f} "
+              f"boot={'on' if bootstrap else 'off'} pf_cover={pf_cover:.2f} phi={phi_mean:.3f} "
+              f"loops={loops:.2f} steps={len(steps)} "
               f"collect {collect_s:.0f}s train {train_s:.0f}s", flush=True)
+        print(f"    adv by kind (raw/normalised mean) | {adv_line}", flush=True)
         if cur_line:
             print(cur_line, flush=True)
         print(f"    top actions | {collapse} | deaths {dict(deaths.most_common(4))} | bosses "

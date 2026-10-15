@@ -112,8 +112,11 @@ def choose_fights(records: list, stats: EncounterStats, n: int, acts=(1, 2),
     return picks
 
 
-def play_fights(net, pools, picks, vocab, boss_ix, dev, bf16=True, loop=1):
+def play_fights(net, pools, picks, vocab, boss_ix, dev, bf16=True, loop=1, credit=None):
     """Plays picks on the per-act deck-server pools. Returns (steps, results).
+
+    ``credit``: the trainer's shaping weights and bootstrap setting (w_combat, w_hp, w_act,
+    w_fight, lam, bootstrap), so an isolated fight is credited exactly as one inside a run.
 
     results: one (encounter, won, n_steps, v_end, record, hp_end, max_hp) per fight, in the order
     its steps appear (fights finish out of order, so this is NOT the order of ``picks``).
@@ -121,6 +124,8 @@ def play_fights(net, pools, picks, vocab, boss_ix, dev, bf16=True, loop=1):
     ``pools``: act -> VecDeckEval (launched with that act's encounter pools).
     """
     from ..deckeval import DeckSpec
+    cr = dict(w_combat=0.0, w_hp=0.0, w_act=0.0, w_fight=0.0, lam=0.95, bootstrap=True)
+    cr.update(credit or {})
     steps_all, results = [], []
     for act, pool in pools.items():
         mine = [(r, rm, e) for r, rm, e in picks if r["act"] == act]
@@ -146,14 +151,19 @@ def play_fights(net, pools, picks, vocab, boss_ix, dev, bf16=True, loop=1):
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
                 out = net(b, loop=loop)
             logits = out["logits"].float()
+            p_fight = torch.sigmoid(out["aux"]["fight_win"].float())
             acts = []
             for j, env in enumerate(idx_list):
                 n = len(legal_list[j])
                 lp = F.log_softmax(logits[j, :n], -1)
                 a = int(torch.multinomial(lp.exp(), 1))
+                pf = float(p_fight[j])
                 st = P.Step(kind="combat", obs=obs_p[j], legal=legal_list[j], a=a,
                             logp=float(lp[a]), v=float(out["value"][j]), loop=loop,
-                            floor=P.floor_of("combat", obs_p[j]))
+                            floor=P.floor_of("combat", obs_p[j]),
+                            act=P.act_of("combat", obs_p[j]), p_fight=pf,
+                            phi=P.potential("combat", obs_p[j], cr["w_combat"], cr["w_hp"],
+                                            cr["w_act"], cr["w_fight"], pf))
                 _open[env].append(st)
                 acts.append(a)
             return acts
@@ -166,17 +176,23 @@ def play_fights(net, pools, picks, vocab, boss_ix, dev, bf16=True, loop=1):
             steps = _open.pop(env, [])
             won = bool(msg.get("won"))
             mx = max(1, int(msg.get("max_hp", 1) or 1))
-            v_end = 0.0
+            v_end = phi_end = 0.0
             if won:
+                # The run decision right after the fight: its value (if bootstrapping) and its
+                # potential, exactly what an in-run fight's last decision would see next.
                 k, o, l = post_fight_obs(rec, msg.get("hp_end", 0), mx)
                 b = to_torch(FT.encode_batch([(k, o, l)], vocab), dev)
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
                     v_end = float(net(b, loop=loop)["value"][0])
+                phi_end = P.potential(k, o, cr["w_combat"], cr["w_hp"], cr["w_act"], cr["w_fight"])
             for st in steps:
                 st.fight_won = int(won)
                 st.fight_hp = (rec["hp"] - int(msg.get("hp_end", 0) or 0)) / mx
                 st.boss_fight = room == "boss"
-            P.compute_targets(steps, False, 1.0, 0.95, v_end=v_end)
+            # The run's outcome is unknown for an isolated fight: no value target without
+            # bootstrapping (mc_end=None), and a lost fight ends the run (0, 0).
+            P.compute_targets(steps, False, 1.0, cr["lam"], v_end=v_end, phi_end=phi_end,
+                              bootstrap=cr["bootstrap"], mc_end=None)
             steps_all.extend(steps)
             # The steps of one fight are contiguous in steps_all, in results order.
             results.append((spec.encounter, won, len(steps), v_end, rec,

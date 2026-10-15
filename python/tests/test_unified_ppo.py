@@ -57,22 +57,23 @@ for won in (True, False):
     check(f"gamma=lambda=1, V=0: every value target = outcome ({'won' if won else 'lost'})",
           all(close(s.ret, float(won)) for s in steps), str([s.ret for s in steps]))
 
-print("\n== TD(0) across the fight -> run boundary (lambda = 0)")
+print("\n== lambda per FLOOR (lambda = 0): one floor shares credit, the next floor bootstraps")
 # travel(f1) -> 2 fight steps (f2) -> card_reward (f2) -> travel (f3), run lost at the end
 vals = [0.20, 0.25, 0.30, 0.40, 0.35]
 kinds = ["travel", "combat", "combat", "card_reward", "travel"]
 floors = [1, 2, 2, 2, 3]
 steps = [mk(k, f, v) for k, f, v in zip(kinds, floors, vals)]
 P.compute_targets(steps, False, gamma=1.0, lam=0.0)
-want = [vals[1], vals[2], vals[3], vals[4], 0.0]        # ret_t = V(s_{t+1}), last = 0
-check("each target is the next state's value; the last is the outcome",
+want = [vals[1], vals[4], vals[4], vals[4], 0.0]
+check("every decision on a floor targets the value at the NEXT floor; the last is the outcome",
       all(close(s.ret, w) for s, w in zip(steps, want)), str([round(s.ret, 3) for s in steps]))
-check("the fight's last decision bootstraps from the card_reward that follows it",
-      close(steps[2].ret, vals[3]))
+check("a fight and its card reward (one floor) bootstrap together from the next floor",
+      close(steps[1].ret, vals[4]) and close(steps[3].ret, vals[4]))
 
 
 def fight_then(v_after, lam):
-    s = [mk("combat", 5, 0.3), mk("combat", 5, 0.3), mk("card_reward", 5, v_after), mk("travel", 6, 0.3)]
+    # The post-fight decision is placed a floor later so that lambda acts between them.
+    s = [mk("combat", 5, 0.3), mk("combat", 5, 0.3), mk("card_reward", 6, v_after), mk("travel", 7, 0.3)]
     P.compute_targets(s, False, gamma=1.0, lam=lam)
     return s
 
@@ -88,13 +89,14 @@ for lam in (0.0, 0.5, 0.95):
           close(keep[1].adv - spend[1].adv, (1 - lam) * 0.20),
           f"{keep[1].adv - spend[1].adv:.4f}")
 keep, spend = fight_then(0.30, 0.5), fight_then(0.10, 0.5)
-check("...and earlier decisions of the fight get a lambda-discounted share of it",
-      close(keep[0].adv - spend[0].adv, 0.5 * (1 - 0.5) * 0.20))
+check("...and EVERY decision of that fight gets the same share (no decay within a floor)",
+      close(keep[0].adv - spend[0].adv, (1 - 0.5) * 0.20))
 
 print("\n== per-floor discounting")
 steps = [mk("combat", 4, 0.5), mk("combat", 4, 0.6), mk("card_reward", 4, 0.7), mk("travel", 6, 0.8)]
 P.compute_targets(steps, True, gamma=0.9, lam=0.0)
-check("no discount between decisions on the same floor", close(steps[0].ret, 0.6) and close(steps[1].ret, 0.7))
+check("no discount within a floor: every floor-4 decision gets gamma**2 once, for the jump",
+      all(close(x.ret, 0.81 * 0.8) for x in steps[:3]), str([round(x.ret, 4) for x in steps]))
 check("gamma**2 across a two-floor jump", close(steps[2].ret, 0.81 * 0.8), f"{steps[2].ret:.4f}")
 check("the winning last step's target is 1", close(steps[3].ret, 1.0))
 
@@ -129,11 +131,97 @@ check("at gamma=lambda=1 the shaped advantage = unshaped - phi(s_t) (it telescop
       all(close(b.adv - a.adv, -b.phi) for a, b in zip(base, shaped)),
       str([round(b.adv - a.adv, 3) for a, b in zip(base, shaped)]))
 
+print("\n== act and fight potentials (dense credit, still win-only optimal)")
+
+
+def mka(kind, floor, act, v, phi):
+    st = mk(kind, floor, v, phi)
+    st.act = act
+    return st
+
+
+# Act 1 ends at the card reward after the boss; act 2 starts at the next travel. w_act = 0.5.
+seq = [mka("combat", 16, 0, 0.3, 0.5 * 0), mka("card_reward", 16, 0, 0.2, 0.5 * 0),
+       mka("travel", 17, 1, 0.9, 0.5 * 1)]
+P.compute_targets(seq, False, 1.0, 0.0, bootstrap=False)
+check("clearing an act credits the boss floor's decisions (fight and reward) by w_act",
+      close(seq[0].adv, 0.5) and close(seq[1].adv, 0.5), str([round(x.adv, 3) for x in seq]))
+check("...and dying afterwards pays it back at the death step (it telescopes)",
+      close(seq[2].adv, -0.5))
+W = dict(w_combat=0.0, w_hp=0.1, w_act=1 / 3, w_fight=1.0)
+run_obs = {"player": {"act": 1, "total_floor": 20, "hp": 40, "max_hp": 80}}
+fight_obs = {"act": 1, "total_floor": 20, "player": {"hp": 40, "max_hp": 80}, "enemies": []}
+phi_run = P.potential("travel", run_obs, **W)
+check("run potential = w_act*(act+1) + w_hp*hp%", close(phi_run, 2 / 3 + 0.05), f"{phi_run:.4f}")
+check("a fight is worth P(win it) times the run state behind it",
+      close(P.potential("combat", fight_obs, **W, p_fight=0.8), 0.8 * phi_run))
+check("CONTINUOUS at a won fight's end: P -> 1 hands over phi_run unchanged",
+      close(P.potential("combat", fight_obs, **W, p_fight=1.0), phi_run))
+check("entering a fight costs exactly its expected risk, (1 - P) * phi_run",
+      close(phi_run - P.potential("combat", fight_obs, **W, p_fight=0.9), 0.1 * phi_run))
+check("CONTINUOUS at death: P -> 0 meets the terminal potential 0",
+      close(P.potential("combat", fight_obs, **W, p_fight=0.0), 0.0))
+
+
+def fight_run(n_fight):
+    """travel -> n_fight decisions of a fight won with certainty -> travel, then run lost."""
+    seq = [P.Step("travel", {}, [{}], 0, 0, 0, 1, 5, phi=phi_run)]
+    seq += [P.Step("combat", {}, [{}], 0, 0, 0, 1, 6,
+                   phi=P.potential("combat", fight_obs, **W, p_fight=1.0)) for _ in range(n_fight)]
+    seq += [P.Step("travel", {}, [{}], 0, 0, 0, 1, 7, phi=phi_run)]
+    P.compute_targets(seq, False, 1.0, 0.95, bootstrap=False)
+    return seq
+
+
+short, long_ = fight_run(3), fight_run(12)
+check("NO incentive to prolong a fight: the decision entering it is credited the same "
+      "whether the fight takes 3 decisions or 12", close(short[0].adv, long_[0].adv, 1e-9),
+      f"{short[0].adv:.5f} vs {long_[0].adv:.5f}")
+
+print("\n== bootstrapping can be switched off")
+v_a = [mk("combat", 2, 0.9), mk("combat", 2, 0.1), mk("card_reward", 2, 0.7)]
+v_b = [mk("combat", 2, 0.2), mk("combat", 2, 0.6), mk("card_reward", 2, 0.05)]
+for x, y in zip(v_a, v_b):
+    x.phi = y.phi = 0.1
+P.compute_targets(v_a, True, 1.0, 0.95, bootstrap=False)
+P.compute_targets(v_b, True, 1.0, 0.95, bootstrap=False)
+check("without bootstrapping, the value head cannot move any advantage",
+      all(close(x.adv, y.adv) for x, y in zip(v_a, v_b)), str([round(x.adv, 4) for x in v_a]))
+check("...and value targets are the realised outcome", all(close(x.ret, 1.0) for x in v_a))
+iso = [mk("combat", 30, 0.3), mk("combat", 30, 0.3)]
+P.compute_targets(iso, False, 1.0, 0.95, bootstrap=False, mc_end=None)
+check("an isolated fight with an unknown future has NO value target (NaN, masked in the loss)",
+      all(math.isnan(x.ret) for x in iso))
+iso2 = [mk("combat", 30, 0.3, 0.2), mk("combat", 30, 0.3, 0.25)]
+P.compute_targets(iso2, False, 1.0, 0.0, bootstrap=False, phi_end=0.6)
+check("a won isolated fight's last decision is credited with the post-fight potential",
+      close(iso2[-1].adv, 0.6 - 0.25), f"{iso2[-1].adv:.3f}")
+
+print("\n== value skill (the gate for bootstrapping)")
+sk = [P.Step("combat", {}, [{}], 0, 0, v, 1, 1) for v in (1.0, 0.0, 1.0, 0.0)]
+for x, y in zip(sk, (1, 0, 1, 0)):
+    x.won = y
+check("perfect predictions have skill 1", close(P.value_skill(sk)[2], 1.0))
+for x in sk:
+    x.v = 0.5
+check("predicting the base rate has skill 0", close(P.value_skill(sk)[2], 0.0))
+for x, v in zip(sk, (0.0, 1.0, 0.0, 1.0)):
+    x.v = v
+check("confidently wrong predictions have negative skill", P.value_skill(sk)[2] < 0)
+
 print("\n== loss weighting")
 kind = torch.tensor([P.COMBAT] * 8 + [FT.DKINDS.index("rest")] * 2 + [FT.DKINDS.index("shop")] * 2)
 vals = torch.tensor([1.0] * 8 + [3.0] * 2 + [5.0] * 2)
 check("combat and run halves count equally; run kinds equally within theirs",
       close(float(P.group_mean(vals, kind)), 0.5 * 1 + 0.5 * (3 + 5) / 2))
+kind2 = torch.tensor([P.COMBAT] * 8 + [FT.DKINDS.index("travel")] * 9 + [FT.DKINDS.index("rest")] * 1)
+vals2 = torch.tensor([1.0] * 8 + [2.0] * 9 + [10.0] * 1)
+check("flat: each run DECISION counts equally (a rare kind cannot dominate its half)",
+      close(float(P.group_mean(vals2, kind2, kind_weight="flat")), 0.5 * 1 + 0.5 * (9 * 2 + 10) / 10, 1e-6))
+check("sqrt: kinds weighted by sqrt(count)",
+      close(float(P.group_mean(vals2, kind2, kind_weight="sqrt")), 0.5 * 1 + 0.5 * (3 * 2 + 1 * 10) / 4, 1e-6))
+check("equal: the 1-sample rest kind weighs as much as 9 travel decisions",
+      close(float(P.group_mean(vals2, kind2, kind_weight="equal")), 0.5 * 1 + 0.5 * (2 + 10) / 2, 1e-6))
 steps = [mk("combat", 1, 0)] * 0
 st = [P.Step("combat", {}, [{}], 0, 0, 0, 1, 1) for _ in range(50)] + \
      [P.Step("rest", {}, [{}], 0, 0, 0, 1, 1) for _ in range(10)]
@@ -182,6 +270,11 @@ out1 = net(b, loop=1)
 _, parts1 = P.ppo_loss(out1, tgt)
 check("...and replaying the WRONG loop counts does not (the test can fail)",
       abs(float(parts1["approx_kl"])) > 1e-6, f"approx_kl {float(parts1['approx_kl']):.1e}")
+
+tgt_nan = dict(tgt, ret=torch.full((24,), float("nan"), dtype=torch.float64))
+total, parts2 = P.ppo_loss(out, tgt_nan)
+check("unknown value targets are masked: the loss stays finite",
+      bool(torch.isfinite(total)) and float(parts2["value"]) == 0.0)
 
 print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILED: {FAILS}'}")
 sys.exit(1 if FAILS else 0)

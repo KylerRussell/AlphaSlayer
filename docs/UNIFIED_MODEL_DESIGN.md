@@ -202,7 +202,7 @@ GAE across the fight/run boundary; per-group averaging weights.
 | M1 | probe additions above | **DONE 2026-09-26.** Live delivery tests pass and fail on the old DLL; no vocab index moved; no game side effects |
 | M2 | encoder + model | **DONE 2026-09-26.** `alphaslayer/unified/`, `tests/test_unified.py`: 45 delivery checks (every M1 field changes the output), reference alignment, order invariance, batch isolation, loops; four reintroduced bugs all caught |
 | M3 | distillation | **DONE 2026-09-26, all configs pass.** 2,005 teacher runs (786k decisions). Every size matches r5 in play within noise (act 1 0.76-0.80 vs 0.766; win 0.044-0.057 vs 0.048) at 91.3-91.6% held-out agreement. Results below |
-| M4 | `train_unified.py` | **Built 2026-09-26; smoke run FAILED acceptance (drift, see below); stabilised variant running.** `alphaslayer/unified/ppo.py` (credit math), `alphaslayer/unified/curriculum.py`, `exp_m4.sh` (auto-resume). Tests: `test_unified_ppo.py` (exact returns/advantages, ratio = 1 with replayed loops), `test_unified_curriculum.py` (live: targeted bosses delivered, terminals = V(post) recomputed; bites on the pre-targeting probe) |
+| M4 | `train_unified.py` | **Stable as of 2026-10-14 (`shaped4`): no degradation over 50 iterations; not yet improving.** Remaining issue: run-decision signal-to-noise (see "shaped4"). `alphaslayer/unified/ppo.py` (credit math), `alphaslayer/unified/curriculum.py`, `exp_m4.sh` (auto-resume). Tests: `test_unified_ppo.py` (exact returns/advantages, ratio = 1 with replayed loops), `test_unified_curriculum.py` (live: targeted bosses delivered, terminals = V(post) recomputed; bites on the pre-targeting probe) |
 | M5 | capability eval suite | every eval in `CAPABILITIES.md` runs on a checkpoint and on r5, with a report |
 | M6 | training round | per-boss, per-act and per-capability comparison against continuing r5, on paired seeds |
 | M7 | determinism race fix | the "mix" side-effect set recorded 5 times is identical every time |
@@ -345,4 +345,95 @@ random-walks and the anchor only slows it. r5 learned because its rewards were d
 is densified with potentials, which provably leave the optimal policy unchanged at gamma = 1:
 acts cleared so far, plus the per-fight win head (the one head with held-out skill). The value
 head is not bootstrapped until its held-out skill turns positive.
+
+### Potential shaping as built (2026-10-14)
+
+- `ppo.potential` adds `w_act * acts cleared` (every decision) and `w_fight * P(win this fight)`
+  (fight decisions; the model's own fight head, read from the rollout forward pass) to the
+  existing hp potentials. Defaults: w_act 0.5, w_fight 0.3. All potentials are zero at the
+  terminal, so at gamma = 1 the optimal policy is still the win-only one.
+- `compute_targets(bootstrap=False)`: V = 0 in every TD error, so advantages are
+  lambda-discounted shaped credit plus the outcome, and value targets are the realised outcome.
+  `--bootstrap auto` switches the value head into GAE only once the EMA of its out-of-sample
+  Brier skill is positive. That skill is measured each iteration on rollout values, which were
+  predicted before those runs' outcomes existed.
+- Isolated curriculum fights get the same potentials, a post-fight boundary potential when won,
+  and NO value target without bootstrapping (the run's outcome is unknown; masked in the loss).
+- Fixed: the loss's fallback `zero` was `logits.sum()*0`. The logits hold the padding mask value,
+  so the sum is -inf and the "zero" was NaN; any empty-mask term would have made the update
+  silently skip. Checked: it never fired in the 150 earlier M4 iterations.
+- Delivery is logged every iteration: `pf_cover` (the fraction of fight decisions carrying
+  P(win this fight)), mean `phi`, `skill`, its EMA, and whether bootstrapping is on.
+
+### Two biases in the first shaping, and the fix (2026-10-14)
+
+The first `shaped` run (additive potentials, lambda 0.95 per decision) rose in entropy
+0.70 -> 0.76 within 19 iterations, its act-2 clears fell, and its policy-gradient term sat at
++0.17 every iteration where ~0 is expected. With V = 0, the lambda-advantage is
+
+    A_t = -phi(s_t) + (1 - lambda) * sum_k lambda^(k-1) phi(s_{t+k}) + (outcome term)
+
+So the policy maximises the average potential over its next ~1/(1-lambda) steps. Potential
+shaping is invariant only over full returns. Two consequences, both found by tests that now guard
+them:
+
+1. **Discontinuous potentials pay for stalling.** The additive fight term (0.3 x P(win fight))
+   dropped at the end of every won fight, so finishing fights was penalised. Fix: a fight's
+   potential is P(win it) x phi_run. It is continuous when a fight is won (P -> 1) and at death
+   (P -> 0), and entering a fight costs exactly its expected risk.
+2. **Per-decision lambda is a hidden discount on decision count.** With V = 0, a longer fight
+   pushes a likely loss further away, and most runs end in a loss, so stalling looks good even
+   with continuous potentials. Fix: lambda decays per FLOOR, like gamma. A fight's decisions
+   share its actual outcome (Monte Carlo within the floor, with the in-fight potential as a
+   baseline); credit decays across floors. Test: the decision entering a fight gets identical
+   credit whether the fight takes 3 decisions or 12 (it failed on the per-decision version).
+
+Defaults now: w_act 1/3 (phi_run ~1 at act 3, the size of the win reward), w_fight 1
+(multiplicative), w_hp 0.1, w_combat 0 (its old form has the same boundary jump), lambda 0.8
+per floor. The corrected run is `shaped2`.
+
+### shaped2 / shaped3: step size, then per-kind weighting (2026-10-14)
+
+- `shaped2` (the corrected potentials) moved ~4x faster than `stab` (KL to anchor 0.13 at iteration 10)
+  and act 1 fell. Dense credit gives every fight decision its fight's real outcome, and lr 5e-5
+  was too large for it. Its auto-bootstrap also switched on after ONE lucky 46-run batch. The gate
+  now needs 8 measured iterations and EMA skill >= 0.05.
+- `shaped3` (lr 1.5e-5) held act 1 flat for 20 iterations (0.660 / 0.667 / 0.715 / 0.679 in
+  5-iteration blocks), then drifted. Per-kind drift against the anchor at iteration 25
+  (`python/drift_unified.py`):
+
+| kind | KL | entropy anchor -> now | top action changed |
+|---|---|---|---|
+| rest | 0.285 | 0.00 -> 0.52 | 0% |
+| potion_gate | 0.233 | 0.07 -> 0.43 | 5% |
+| card_reward | 0.168 | 0.34 -> 0.62 | 13% |
+| combat | 0.027 | 1.03 -> 1.00 | 12% |
+
+  Combat barely moved; the RUN decisions random-walked (entropy up, preference unchanged). The
+  cause is r5's per-kind loss weighting: a campfire (~5% of steps) pulled as hard as all travel,
+  so its noise was amplified. `--kind-weight flat` (now the default) weights run decisions by
+  frequency, as standard PPO does. The run is `shaped4`.
+
+### shaped4: the first stable configuration (2026-10-14)
+
+Settings: potential shaping (continuous; lambda 0.8 per floor), lr 1.5e-5, entropy 0.001, anchor
+KL held at 0.1, hardened auto-bootstrap gate (stayed off: value skill never positive),
+`--kind-weight flat`. Same seeds as every M4 run (`logs/m4_shaped4.log`).
+
+| run | act 1 first -> second half | change | win |
+|---|---|---|---|
+| smoke | 0.652 -> 0.549 | -0.103 +- 0.020 | 0.034 -> 0.014 |
+| stab | 0.674 -> 0.608 | -0.066 +- 0.020 | 0.049 -> 0.039 |
+| mc | 0.644 -> 0.600 | -0.044 +- 0.020 | 0.039 -> 0.024 |
+| shaped4 | 0.711 -> 0.720 | +0.009 +- 0.019 | 0.041 -> 0.031 |
+
+Act 1 is flat in 10-iteration blocks (0.711, 0.705, 0.714, 0.726, 0.721), fights hold at 0.92,
+and act 2 at 0.17-0.19. It is STABLE, not yet improving; r5 needed hundreds of iterations to
+show gains.
+
+Remaining issue: run decisions still random-walk, about 15 iterations later and slower than in
+shaped3. At iteration ~40: card_reward entropy 0.34 -> 0.55, shop 0.29 -> 0.62, rest
+0.00 -> 0.29, with top actions mostly unchanged; combat barely moved (KL 0.034). Their
+advantages are mostly noise. Remedies in order: a larger batch per update (96 runs halves the
+variance), or a stronger anchor on run decisions only, until their signal beats the noise.
 
