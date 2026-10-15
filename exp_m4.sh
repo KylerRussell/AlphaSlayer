@@ -18,7 +18,6 @@ OUT=unified_m4_$TAG.pt
 cd "$ROOT/python"
 export XDG_DATA_HOME="$("$ROOT/headless_home.sh" 2>/dev/null)"
 export PYTHONHASHSEED=0 HIP_VISIBLE_DEVICES=0 HSA_ENABLE_SDMA=0 PYTHONPATH=.
-export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 done_iters() {
   $PY - "$OUT" <<'EOF' 2>/dev/null || echo 0

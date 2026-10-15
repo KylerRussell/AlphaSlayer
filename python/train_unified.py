@@ -61,6 +61,9 @@ def main():
     ap.add_argument("--runs-per-env", type=int, default=2)
     ap.add_argument("--act-cap", type=int, default=3)
     ap.add_argument("--collect-timeout", type=float, default=900.0)
+    ap.add_argument("--env-restarts", type=int, default=2,
+                    help="relaunch a crashed/wedged game process up to N times per iteration "
+                         "for the runs it still owes (0 = drop them, the old behaviour)")
     ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--minibatch", type=int, default=512)
@@ -69,6 +72,10 @@ def main():
     ap.add_argument("--vf-coef", type=float, default=0.5)
     ap.add_argument("--aux-coef", type=float, default=0.25)
     ap.add_argument("--kl-coef", type=float, default=0.1, help="KL toward the anchor at iter 1")
+    ap.add_argument("--kl-run-mult", type=float, default=1.0,
+                    help="multiplies the anchor KL on run decisions only (combat keeps --kl-coef)")
+    ap.add_argument("--adv-center", choices=["half", "kind"], default="half",
+                    help="subtract each half's mean advantage, or each decision kind's")
     ap.add_argument("--kl-anneal", type=int, default=100, help="iterations for the KL to reach 0")
     ap.add_argument("--gamma", type=float, default=1.0, help="discount PER FLOOR")
     ap.add_argument("--lam", type=float, default=0.8,
@@ -219,12 +226,19 @@ def main():
                 deaths[f"a{rr.act + 1}-{fr.room if fr is not None and not fr.won else 'other'}"] += 1
             last_fight.pop(env, None)
 
+        def on_restart(env):
+            buf.drop_env(env)
+            last_fight.pop(env, None)
+            last_player.pop(env, None)
+
         with VecRunEnv(n_envs=a.envs, characters=CHARS, runs_per_env=a.runs_per_env,
                        seed=f"{a.seed_prefix}{it}_", ascension=0, act_cap=a.act_cap,
-                       run_offset=it * 1000) as venv:
+                       run_offset=it * 1000, restarts=a.env_restarts) as venv:
             venv.run(lambda k, o, l, i: act_policy(k, o, l, i, buf), on_fight=on_fight,
-                     on_terminal=on_terminal, deadline_s=a.collect_timeout)
+                     on_terminal=on_terminal, deadline_s=a.collect_timeout,
+                     on_restart=on_restart)
             results = list(venv.results)
+            env_fail = (venv.crashed, venv.stalled, venv.restarted)
         buf.drop_open()
         steps = buf.done
         collect_s = time.time() - t0
@@ -286,7 +300,7 @@ def main():
         # ---- PPO update --------------------------------------------------------------------
         t1 = time.time()
         packed = DS.Packed(DS.pack([{"kind": s.kind, "obs": s.obs, "legal": s.legal} for s in steps], vocab))
-        adv = P.normalise_advantages(steps)
+        adv = P.normalise_advantages(steps, center=a.adv_center)
         # Per-kind advantage means. Normalisation centres each HALF (fight / run), but the loss
         # averages per KIND, so a kind whose advantages are systematically negative pushes
         # probability away from whatever it sampled, and its entropy rises. Logged every
@@ -333,7 +347,8 @@ def main():
                 total, parts = P.ppo_loss(out, tgt, clip=a.clip, ent_coef=a.ent_coef,
                                           vf_coef=a.vf_coef, aux_coef=a.aux_coef,
                                           run_weight=a.run_weight, anchor_logp=anchor_logp,
-                                          kl_coef=kl_coef, kind_weight=a.kind_weight)
+                                          kl_coef=kl_coef, kind_weight=a.kind_weight,
+                                          kl_run_mult=a.kl_run_mult)
                 opt.zero_grad(set_to_none=True)
                 total.backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
@@ -378,6 +393,7 @@ def main():
               f"brier={brier:.4f}/base {base:.4f} skill={skill:+.3f} ema={skill_ema if skill_ema is not None else float('nan'):+.3f} "
               f"boot={'on' if bootstrap else 'off'} pf_cover={pf_cover:.2f} phi={phi_mean:.3f} "
               f"loops={loops:.2f} steps={len(steps)} "
+              f"crash/stall/relaunch={env_fail[0]}/{env_fail[1]}/{env_fail[2]} "
               f"collect {collect_s:.0f}s train {train_s:.0f}s", flush=True)
         print(f"    adv by kind (raw/normalised mean) | {adv_line}", flush=True)
         if cur_line:

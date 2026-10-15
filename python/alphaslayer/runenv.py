@@ -74,7 +74,8 @@ class VecRunEnv:
                  seed="ALPHASLAYER", ascension=0, game_dir=DEFAULT_GAME, fixed_fps=5000,
                  turn_cap=50, floor_cap=200, act_cap=0, quiet=True, batch_timeout=0.004,
                  run_offset=0, out_dir="/tmp/alphaslayer_runserve",
-                 stall_dir="/tmp/alphaslayer_stalls", close_on_exit=False, expect_sizes=None):
+                 stall_dir="/tmp/alphaslayer_stalls", close_on_exit=False, expect_sizes=None,
+                 restarts=0, restart_connect_timeout=120.0):
         self.expect_sizes = expect_sizes or {}
         self._sizes_checked = False
         self.n_envs = n_envs
@@ -92,38 +93,33 @@ class VecRunEnv:
         self.crashed = 0
         self.crashed_envs: list[tuple[int, int | None]] = []
         self._runs_by_env: dict[int, int] = {}
+        # Relaunching an env that crashed or wedged. Every failure seen so far (776 crashes and
+        # all preserved stall logs) happens in a process's FIRST run, within a second of the
+        # run starting: a race in the game's own worker threads, which we cannot fix. Without a
+        # relaunch each one silently costs that env's whole batch of runs. A relaunch plays
+        # only the runs still owed (--probe-run-offset continues the env's seed sequence, so no
+        # completed run is replayed). Opt-in: the caller must pass run(on_restart=...) to drop
+        # the dead process's partial run, or its steps would be glued onto the new one's.
+        self.max_restarts = restarts
+        self.restart_connect_timeout = restart_connect_timeout
+        self.restarted = 0
+        self._restarts: dict[int, int] = {}
+        self._awaiting: dict[int, float] = {}     # env idx -> reconnect deadline
+        self._last_seen: dict[int, float] = {}
+        self.runs_per_env = runs_per_env
+        self._run_offset = run_offset
+        self._spawn_cfg = dict(game_dir=game_dir, fixed_fps=fixed_fps, seed=seed,
+                               ascension=ascension, turn_cap=turn_cap, floor_cap=floor_cap,
+                               act_cap=act_cap, quiet=quiet)
         self._out_dir = out_dir
         self._stall_dir = stall_dir
         self.close_on_exit = close_on_exit
 
         self._srvs = listen_per_env(n_envs)
 
-        env = dict(os.environ, SteamAppId="2868840", SteamGameId="2868840")
         roster = characters or [character]
         self.characters = [roster[i % len(roster)] for i in range(n_envs)]
-        self.procs = []
-        for i in range(n_envs):
-            args = [
-                os.path.join(game_dir, "SlayTheSpire2"), "--headless",
-                "--fixed-fps", str(fixed_fps),
-                "--probe=runserve", f"--probe-out={out_dir}{i}", "--probe-quit",
-                f"--probe-port={self._srvs[i].getsockname()[1]}",
-                f"--probe-runs={runs_per_env}",
-                f"--probe-character={self.characters[i]}",
-                f"--probe-seed={seed}{i}",
-                f"--probe-ascension={ascension}",
-                f"--probe-turn-cap={turn_cap}",
-                f"--probe-floor-cap={floor_cap}",
-                # Distinct seed sequences per env AND per iteration, so successive rollouts
-                # do not replay the same maps.
-                f"--probe-run-offset={run_offset}",
-            ]
-            if act_cap:
-                args.append(f"--probe-act-cap={act_cap}")
-            self.procs.append(subprocess.Popen(
-                args, cwd=game_dir, env=env, preexec_fn=game_preexec,
-                stdout=subprocess.DEVNULL if quiet else None,
-                stderr=subprocess.DEVNULL if quiet else None))
+        self.procs = [self._spawn(i, runs_per_env, run_offset) for i in range(n_envs)]
 
         accepted = accept_per_env(self._srvs, 120, "VecRunEnv")
         self.conns = [accepted[i] for i in sorted(accepted)]
@@ -134,28 +130,117 @@ class VecRunEnv:
         for c in self.conns:
             self._sel.register(c.sock, selectors.EVENT_READ, c)
 
+    def _spawn(self, i, runs, offset):
+        c = self._spawn_cfg
+        env = dict(os.environ, SteamAppId="2868840", SteamGameId="2868840")
+        args = [
+            os.path.join(c["game_dir"], "SlayTheSpire2"), "--headless",
+            "--fixed-fps", str(c["fixed_fps"]),
+            "--probe=runserve", f"--probe-out={self._out_dir}{i}", "--probe-quit",
+            f"--probe-port={self._srvs[i].getsockname()[1]}",
+            f"--probe-runs={runs}",
+            f"--probe-character={self.characters[i]}",
+            f"--probe-seed={c['seed']}{i}",
+            f"--probe-ascension={c['ascension']}",
+            f"--probe-turn-cap={c['turn_cap']}",
+            f"--probe-floor-cap={c['floor_cap']}",
+            # Distinct seed sequences per env AND per iteration, so successive rollouts
+            # do not replay the same maps.
+            f"--probe-run-offset={offset}",
+        ]
+        if c["act_cap"]:
+            args.append(f"--probe-act-cap={c['act_cap']}")
+        return subprocess.Popen(
+            args, cwd=c["game_dir"], env=env, preexec_fn=game_preexec,
+            stdout=subprocess.DEVNULL if c["quiet"] else None,
+            stderr=subprocess.DEVNULL if c["quiet"] else None)
+
+    def _maybe_restart(self, conn, on_restart):
+        """Relaunches a crashed or wedged env for the runs it still owes. True if relaunched."""
+        i = conn.idx
+        done = self._runs_by_env.get(i, 0)
+        owed = self.runs_per_env - done
+        if (owed <= 0 or self._restarts.get(i, 0) >= self.max_restarts
+                or on_restart is None or self.timed_out):
+            return False
+        p = self.procs[i]
+        if p.poll() is None:              # wedged, not dead: it must go before its successor
+            p.kill()
+            try:
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+        on_restart(i)
+        self._restarts[i] = self._restarts.get(i, 0) + 1
+        self.restarted += 1
+        self.procs[i] = self._spawn(i, owed, self._run_offset + done)
+        self._awaiting[i] = time.time() + self.restart_connect_timeout
+        self._sel.register(self._srvs[i], selectors.EVENT_READ, ("listen", i))
+        print(f"VecRunEnv: relaunched env {i} ({self.characters[i]}) for {owed} run(s) "
+              f"(restart {self._restarts[i]}/{self.max_restarts})", flush=True)
+        return True
+
+    def _accept_restarted(self, i):
+        try:
+            sock, _ = self._srvs[i].accept()
+        except BlockingIOError:
+            return
+        try:
+            self._sel.unregister(self._srvs[i])
+        except (KeyError, ValueError):
+            pass
+        self._awaiting.pop(i, None)
+        c = _Conn(sock, i)
+        self.conns = [c if old.idx == i else old for old in self.conns]
+        self._sel.register(c.sock, selectors.EVENT_READ, c)
+        self._last_seen[i] = time.time()
+
+    def _expire_restarts(self):
+        now = time.time()
+        for i, dl in list(self._awaiting.items()):
+            if now > dl:
+                print(f"VecRunEnv: relaunched env {i} never connected; giving up on it",
+                      flush=True)
+                self._give_up_restart(i)
+
+    def _give_up_restart(self, i):
+        self._awaiting.pop(i, None)
+        try:
+            self._sel.unregister(self._srvs[i])
+        except (KeyError, ValueError):
+            pass
+        if self.procs[i].poll() is None:
+            self.procs[i].kill()
+
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
         self.close()
 
-    def run(self, policy, on_fight=None, on_terminal=None, max_steps=None, deadline_s=None):
+    def run(self, policy, on_fight=None, on_terminal=None, max_steps=None, deadline_s=None,
+            on_restart=None):
         """Drives the envs. ``policy(kinds, obs, legal, env_idxs) -> list[int]``.
 
         ``on_fight(env_idx, FightResult)`` fires at the end of each combat and
         ``on_terminal(env_idx, RunResult)`` at the end of each run. Two callbacks because the
         two policies are credited from different things: the combat policy from the fight it
         just played, the run policy from how the run ends.
+
+        ``on_restart(env_idx)`` fires just before a crashed or wedged env is relaunched (only
+        with ``restarts`` > 0): the caller must discard that env's unfinished run.
         """
+        if self.max_restarts and on_restart is None:
+            raise ValueError("restarts > 0 needs run(on_restart=...) to drop the dead "
+                             "process's unfinished run")
         pending: list[tuple[_Conn, dict]] = []
         t0 = time.time()
         last_activity = time.time()
-        last_seen = {c.idx: time.time() for c in self.conns}
+        self._last_seen = last_seen = {c.idx: time.time() for c in self.conns}
 
         hard_deadline = (t0 + deadline_s) if deadline_s else None
         self.timed_out = False
-        while any(c.alive for c in self.conns):
+        while any(c.alive for c in self.conns) or self._awaiting:
             # Hard wall-clock cap on the whole pass. Nothing inside a rollout should be able
             # to consume hours: whatever the cause (a wedged env, a machine under memory
             # pressure), the trainer takes what it has and moves on rather than disappearing.
@@ -166,16 +251,20 @@ class VecRunEnv:
                 self.timed_out = True
                 for c in live_conns:
                     self._unregister(c)
+                for i in list(self._awaiting):
+                    self._give_up_restart(i)
                 break
             deadline = None
             while True:
                 live = sum(1 for c in self.conns if c.alive)
-                if live == 0 or (pending and len(pending) >= live):
+                if (live == 0 and not self._awaiting) or (pending and len(pending) >= live):
                     break
                 remaining = self.batch_timeout if deadline is None else deadline - time.time()
                 if pending and remaining <= 0:
                     break
                 events = self._sel.select(timeout=max(0.0005, min(remaining, 0.05)))
+                if self._awaiting:
+                    self._expire_restarts()
                 if events:
                     last_activity = time.time()
                 # OFF by default, and measured rather than assumed: closing on process exit
@@ -201,6 +290,7 @@ class VecRunEnv:
                         if now - last_seen.get(c.idx, now) > self.ENV_STALL_TIMEOUT:
                             self._on_stall(c)
                             self._unregister(c)
+                            self._maybe_restart(c, on_restart)
                 if not events and time.time() - last_activity > self.STALL_TIMEOUT and not pending:
                     live_conns = [c for c in self.conns if c.alive]
                     print(f"VecRunEnv: no traffic from any env for {self.STALL_TIMEOUT:.0f}s; "
@@ -208,8 +298,12 @@ class VecRunEnv:
                     for c in live_conns:
                         self._on_stall(c)
                         self._unregister(c)
+                        self._maybe_restart(c, on_restart)
                     break
                 for key, _ in events:
+                    if isinstance(key.data, tuple):          # a relaunched env connecting
+                        self._accept_restarted(key.data[1])
+                        continue
                     conn: _Conn = key.data
                     if not conn.alive:
                         continue
@@ -219,16 +313,21 @@ class VecRunEnv:
                         if d is not None:
                             pending.append(d)
                     if not conn.alive:
+                        self._unregister(conn)
                         if not conn.done:
                             self._on_exit(conn)
-                        self._unregister(conn)
+                            self._maybe_restart(conn, on_restart)
                 if pending and deadline is None:
                     deadline = time.time() + self.batch_timeout
-                if not events and not pending and not any(c.alive for c in self.conns):
+                if (not events and not pending and not any(c.alive for c in self.conns)
+                        and not self._awaiting):
                     break
 
+            # A process can send a decision and die before we answer it. Answering is pointless,
+            # and recording it would add a step to the run on_restart just discarded.
+            pending = [(c, m) for c, m in pending if c.alive]
             if not pending:
-                if not any(c.alive for c in self.conns):
+                if not any(c.alive for c in self.conns) and not self._awaiting:
                     break
                 continue
 

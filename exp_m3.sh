@@ -19,7 +19,6 @@ RUNS=${RUNS:-500}
 cd "$ROOT/python"
 export XDG_DATA_HOME="$("$ROOT/headless_home.sh" 2>/dev/null)"
 export PYTHONHASHSEED=0 HIP_VISIBLE_DEVICES=0 HSA_ENABLE_SDMA=0 PYTHONPATH=.
-export PYTORCH_ALLOC_CONF=expandable_segments:True
 say() { echo "[$(date '+%m-%d %H:%M')] $*" | tee -a "$LOG"; }
 
 say "=== M3 start: epochs=$EPOCHS eval runs=$RUNS ==="

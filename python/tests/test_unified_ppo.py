@@ -276,5 +276,45 @@ total, parts2 = P.ppo_loss(out, tgt_nan)
 check("unknown value targets are masked: the loss stays finite",
       bool(torch.isfinite(total)) and float(parts2["value"]) == 0.0)
 
+print("\n== run-only anchor KL multiplier")
+torch.manual_seed(1)
+anc = torch.log_softmax(out["logits"] + torch.randn_like(out["logits"]) * b["cand_mask"], -1)
+t0, _ = P.ppo_loss(out, tgt, kl_coef=0.0)
+t1, pk1 = P.ppo_loss(out, tgt, anchor_logp=anc, kl_coef=1.0)
+t3, pk3 = P.ppo_loss(out, tgt, anchor_logp=anc, kl_coef=1.0, kl_run_mult=3.0)
+lp_all = torch.log_softmax(out["logits"], -1)
+kl_rows = (anc.exp() * (anc - lp_all)).masked_fill(~b["cand_mask"], 0.0).sum(-1)
+is_run = tgt["kind"] != P.COMBAT
+check("the fixture batch mixes combat and run rows", bool(is_run.any() and (~is_run).any()))
+check("mult=1 adds exactly kl_coef * parts['kl']", close(float(t1 - t0), float(pk1["kl"]), 1e-9))
+exp3 = 2.0 * float(P.group_mean(kl_rows * is_run, tgt["kind"]))
+check("mult=3 adds 2x the RUN half's KL and nothing on combat", close(float(t3 - t1), exp3, 1e-9),
+      f"{float(t3 - t1):.6f} vs {exp3:.6f}")
+check("parts['kl'] is logged unweighted", close(float(pk3["kl"]), float(pk1["kl"]), 1e-12))
+
+print("\n== advantage centering per decision kind")
+from types import SimpleNamespace as NS
+rng_ = np.random.default_rng(0)
+noise = rng_.normal(0, 0.3, 600)
+st_ = ([NS(kind="combat", adv=float(x)) for x in noise[:200]]
+       + [NS(kind="potion_gate", adv=float(-1.0 + x)) for x in noise[200:400]]
+       + [NS(kind="card_reward", adv=float(0.0 + x)) for x in noise[400:]]
+       + [NS(kind="potion_ooc", adv=2.0)])
+half = P.normalise_advantages(st_, "half")
+kind = P.normalise_advantages(st_, "kind")
+raw = np.array([s_.adv for s_ in st_])
+rm = np.array([s_.kind != "combat" for s_ in st_])
+old = np.where(rm, (raw - raw[rm].mean()) / raw[rm].std(), (raw - raw[~rm].mean()) / raw[~rm].std())
+check("center='half' is the previous behaviour exactly", np.allclose(half, old, atol=1e-6))
+g = slice(200, 400)
+check("half-centering leaves the gate's kind-wide offset in (the long1 bias)",
+      half[g].mean() < -0.5, f"{half[g].mean():+.2f}")
+check("kind-centering removes it (residual is only the shrinkage)", abs(kind[g].mean()) < 0.1,
+      f"{kind[g].mean():+.3f}")
+check("within a kind, differences are unchanged (same scale)",
+      np.allclose(np.diff(kind[g]), np.diff(half[g]), atol=1e-6))
+check("a kind seen once is shrunk toward the half mean, not zeroed", kind[-1] > 1.0, f"{kind[-1]:.2f}")
+check("the combat half is untouched by run kinds", np.allclose(kind[:200], half[:200], atol=1e-6))
+
 print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILED: {FAILS}'}")
 sys.exit(1 if FAILS else 0)

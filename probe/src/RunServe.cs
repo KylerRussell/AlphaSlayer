@@ -468,19 +468,41 @@ public static class RunServe
 
     // ---------- transport ----------
 
+    // Decisions are not only asked from the run loop: game callbacks ask too (the reward
+    // selector's card_reward, a card prompt answered through DriveWithSelections). When two
+    // overlapped, the second ReadLineAsync threw "The stream is currently in use by a previous
+    // operation" and ended the whole session (seed U4_2_52000, three separate runs). Each
+    // round trip is now atomic; the second decision waits for the first answer, which depends
+    // only on the policy, so this cannot deadlock.
+    private static readonly System.Threading.SemaphoreSlim _decideLock = new(1, 1);
+    private static string _decideKind = "";
+    private static int _decideCollisions;
+
     /// <summary>One request/response round trip. Returns -1 if the policy went away.</summary>
     private static async Task<int> Decide(string kind, Dictionary<string, object> obs, object[] legal, int count)
     {
-        _byKind[kind] = _byKind.GetValueOrDefault(kind) + 1;
-        _steps++;
-        await Send(new Dictionary<string, object>
+        if (!_decideLock.Wait(0))
         {
-            ["t"] = "decision", ["kind"] = kind, ["run"] = _run, ["step"] = _step++,
-            ["obs"] = obs, ["legal"] = legal,
-        });
-        var line = await _r.ReadLineAsync();
-        if (line == null) return -1;
-        return Math.Clamp(ParseAction(line), 0, Math.Max(0, count - 1));
+            if (_decideCollisions++ < 3)
+                Probe.Log($"concurrent decision: {kind} waits behind {_decideKind} " +
+                          $"(run {_run}, step {_step})\n{Environment.StackTrace}");
+            await _decideLock.WaitAsync();
+        }
+        try
+        {
+            _decideKind = kind;
+            _byKind[kind] = _byKind.GetValueOrDefault(kind) + 1;
+            _steps++;
+            await Send(new Dictionary<string, object>
+            {
+                ["t"] = "decision", ["kind"] = kind, ["run"] = _run, ["step"] = _step++,
+                ["obs"] = obs, ["legal"] = legal,
+            });
+            var line = await _r.ReadLineAsync();
+            if (line == null) return -1;
+            return Math.Clamp(ParseAction(line), 0, Math.Max(0, count - 1));
+        }
+        finally { _decideLock.Release(); }
     }
 
     private static Task Send(Dictionary<string, object> msg) =>

@@ -217,6 +217,12 @@ class RunBuffer:
         self.runs.append({"won": int(won), "act": act_reached, "floors": floors,
                           "n": len(steps)})
 
+    def drop_env(self, env):
+        """An env's game process died mid-run and is being relaunched: its unfinished run has
+        no outcome, and the relaunched process's steps must not be appended to it."""
+        self.open.pop(env, None)
+        self.fight_open.pop(env, None)
+
     def drop_open(self):
         """Runs cut off by a collection deadline have no outcome; they are dropped, not guessed."""
         self.open.clear()
@@ -263,11 +269,16 @@ def group_mean(per_row: torch.Tensor, kind: torch.Tensor, run_weight: float = 0.
 def ppo_loss(out: dict, tgt: dict, clip: float = 0.2, ent_coef: float = 0.01,
              vf_coef: float = 0.5, aux_coef: float = 0.25, run_weight: float = 0.5,
              anchor_logp: torch.Tensor | None = None, kl_coef: float = 0.0,
-             kind_weight: str = "equal"):
+             kind_weight: str = "equal", kl_run_mult: float = 1.0):
     """PPO clipped surrogate + value BCE + aux + optional KL toward an anchor policy.
 
     tgt: a (B,) chosen action, old_logp (B,), adv (B,) already normalised, ret (B,) in [0,1],
     kind (B,), and the aux labels as in train_distill.
+
+    kl_run_mult scales the anchor KL on RUN decisions only. Combat gets dense credit from every
+    fight; a run decision's advantage is mostly the luck of the rest of the run, and long1
+    showed the result at a shared KL: combat held (KL 0.06) while shop entropy went
+    0.65 -> 0.85 in 20 iterations with no change in outcomes. parts["kl"] stays unweighted.
     """
     logits = _hi(out["logits"])
     mask = tgt["cand_mask"]
@@ -311,25 +322,48 @@ def ppo_loss(out: dict, tgt: dict, clip: float = 0.2, ent_coef: float = 0.01,
         pa = anchor_logp.exp()
         kl = (pa * (anchor_logp - logp_all)).masked_fill(~mask, 0.0).sum(-1)
         parts["kl"] = group_mean(kl, kind, run_weight, kind_weight)
+        kl_term = (group_mean(kl * torch.where(kind == COMBAT, 1.0, kl_run_mult), kind,
+                              run_weight, kind_weight) if kl_run_mult != 1.0 else parts["kl"])
+    else:
+        kl_term = zero
     total = (parts["pg"] - ent_coef * parts["ent"] + vf_coef * parts["value"]
              + aux_coef * sum(parts[k] for k in ("act_clear", "reach_act3", "floors_left",
                                                  "fight_win", "fight_hp"))
-             + kl_coef * parts["kl"])
+             + kl_coef * kl_term)
     with torch.no_grad():
         parts["clipfrac"] = ((ratio - 1).abs() > clip).float().mean()
         parts["approx_kl"] = (tgt["old_logp"] - logp).mean()
     return total, parts
 
 
-def normalise_advantages(steps: list) -> np.ndarray:
-    """Per-group normalisation (combat vs run), so neither half's scale dominates."""
+def normalise_advantages(steps: list, center: str = "half", prior_n: float = 16.0) -> np.ndarray:
+    """Per-group normalisation (combat vs run), so neither half's scale dominates.
+
+    center="half" subtracts each half's mean. center="kind" subtracts each decision KIND's
+    mean (shrunk toward the half's mean with weight prior_n, so a kind seen twice is not
+    zeroed). A kind is a function of the state, so this is a valid baseline: the expected
+    gradient is unchanged. What it removes is a kind-wide offset that the sampled actions
+    absorb. In long1 the potion gate sits before every fight, so it carries every fight death
+    in its floor. Its mean normalised advantage was -0.29 every iteration, pushing down
+    whatever it sampled (allow fell 97% -> 82%) with no information about which choice was
+    better. Scale is still per half.
+    """
     adv = np.array([s.adv for s in steps], np.float64)
-    is_c = np.array([s.kind == "combat" for s in steps])
+    kinds = np.array([s.kind for s in steps])
+    is_c = kinds == "combat"
     out = np.zeros_like(adv)
     for m in (is_c, ~is_c):
         if m.sum() > 1:
-            x = adv[m]
-            out[m] = (x - x.mean()) / (x.std() + 1e-8)
+            x = adv[m].copy()
+            if center == "kind":
+                hm = x.mean()
+                for k in np.unique(kinds[m]):
+                    km = kinds[m] == k
+                    n = km.sum()
+                    x[km] -= (n * x[km].mean() + prior_n * hm) / (n + prior_n)
+            else:
+                x -= x.mean()
+            out[m] = x / (adv[m].std() + 1e-8)
         elif m.sum() == 1:
             out[m] = 0.0
     return out.astype(np.float32)
