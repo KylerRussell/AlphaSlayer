@@ -257,10 +257,13 @@ faster per decision, which matters for search.
   much fights lean on the value head.
 - **PPO**: loop counts recorded per decision and replayed (`loop_rows`), so the ratio is exactly 1
   before the first update (tested to 1e-17); the loss upcasts only bf16/fp16. Combat and run
-  halves weighted equally, and advantages normalised per half. KL to the distilled anchor
-  anneals to 0 over 100 iterations.
-- **Curriculum** (`alphaslayer/unified/curriculum.py`, `--curriculum-every N`): isolated act-2/3
-  fights on decks harvested from the model's own runs, at their real entry HP.
+  halves weighted equally. Advantages are normalised per half, and each decision kind's mean is
+  subtracted (`--adv-center kind`). KL to the anchor is held at 0.1, 5x on run decisions
+  (`--kl-run-mult`; see long1 / long2).
+- **Curriculum** (`alphaslayer/unified/curriculum.py`, `--curriculum-every N`, off by default):
+  isolated act-2/3 fights on decks harvested from the model's own runs, at their real entry HP.
+  **Not used from 2026-10-15 on:** the model must learn from full runs only, so targeted fight
+  or boss training is out of scope; fixes go into how it learns from runs.
   - Targets are chosen by per-encounter loss rate (an EMA over in-run and curriculum fights).
     DeckServe now takes an `encounter` field, and an encounter outside the pool is a loud error.
   - A won fight ends at V(post-fight state): the harvested run state with the HP the fight
@@ -437,3 +440,101 @@ shaped3. At iteration ~40: card_reward entropy 0.34 -> 0.55, shop 0.29 -> 0.62, 
 advantages are mostly noise. Remedies in order: a larger batch per update (96 runs halves the
 variance), or a stronger anchor on run decisions only, until their signal beats the noise.
 
+### long1 / long2: per-kind baselines and a run-decision anchor (2026-10-15)
+
+Both used shaped4 plus 96 runs per iteration (`--runs-per-env 4`) for 150 iterations on the same
+seeds (`--seed-prefix L1_`). Both also ran the combat curriculum every 5 iterations, which is
+no longer used (see Curriculum).
+
+- **long1** made no progress. In 25-iteration windows, win was 0.027 -> 0.027 (0.013 at 51-75)
+  and a2 0.16 -> 0.16. The larger batch did not stop the run-decision random walk (shop entropy
+  0.65 -> 0.85). The potion gate's normalised advantage averaged -0.25 in EVERY window: it
+  sits before every fight and absorbs that fight's deaths, so whatever it sampled was pushed
+  down, and allow fell 97% -> 83%.
+- **long2** added `--adv-center kind` (each decision kind gets its own mean baseline, shrunk
+  toward the half mean) and `--kl-run-mult 5` (5x anchor KL on run decisions only).
+
+| iterations 1-143, paired | long1 | long2 | long2 - long1 |
+|---|---|---|---|
+| win | 0.022 | 0.038 | +0.017 |
+| act 2 | 0.150 | 0.192 | +0.043 |
+| act 1 | 0.735 | 0.724 | -0.012 |
+| anchor KL | 0.11 | 0.035 | |
+| potion gate allow | 83% | 95% | |
+
+long2 was ahead on win and act 2 in every 25-iteration window, and the drift is gone. But it
+only HOLDS the starting policy (first five iterations: win 0.042, a2 0.18); every window is
+flat. Both fixes are now the defaults, along with shaped4's lr, entropy and held KL.
+
+Act-3 bosses cap the win rate. long2 beat Test Subject 97% of the time (503 fights), Aeonglass
+4.6% (415) and Queen 2.6% (469), so nearly every win is a run that drew Test Subject. The next
+problem: getting PPO on full runs to improve, not just hold, with Queen and Aeonglass as
+the bottleneck.
+
+### Why PPO on runs does not learn: gradient signal-to-noise (2026-10-15)
+
+Measured offline on 20 collect-only iterations of the long2 policy (1,916 runs;
+`train_unified.py --collect-only --dump-steps`). The policy is fixed, so each iteration's policy
+gradient is an independent estimate of the same expected gradient. **Consistency** = the mean
+pairwise cosine between iterations (0 = pure noise, 1 = pure signal), and B_noise = the batch
+(in runs) at which signal equals noise (`python/grad_snr.py`; gradients are CountSketched to
+1M dimensions, with jackknife errors).
+
+| combat credit (`--lam-step`) | combat consistency | combat B_noise | run consistency |
+|---|---|---|---|
+| fight's final result (1, the trainer until now) | 0.030 +- 0.016 | 3,100 runs | 0.021 +- 0.017 |
+| TD, trace 0.9 within a floor | 0.058 +- 0.021 | 1,550 | 0.047 +- 0.021 |
+| TD, trace 0.7 | 0.104 +- 0.028 | 820 | 0.043 +- 0.023 |
+| TD, trace 0 | 0.276 +- 0.021 | 250 | 0.083 +- 0.032 |
+| pure win/loss Monte Carlo | 0.007 +- 0.010 | 14,000 | 0.009 +- 0.014 |
+
+A 96-run update was ~97% noise. Without the anchor, the noise random-walks the policy (long1).
+With it, the policy is held at the start (long2). Credit by TD within a fight, on the fight
+potential P(win this fight) * phi_run, judges each action by how it moved the fight head's
+estimate. Its expected direction agrees with the trainer's (cosine 0.76 +- 0.11 at trace 0,
+0.84 +- 0.20 at 0.7), so it is the same signal with ~9x less noise, plus some critic bias. The fight
+head earns that role: held-out skill +0.27 (+0.35 in acts 2-3), roughly calibrated.
+
+Run-level win critics do not: the checkpoint's value head scores -0.17 Brier skill out of
+sample. Fresh MLP heads on frozen trunk features stay negative for win even with 1,440 training
+runs, and for act_clear / reach_act3 they score below a model that sees only act and floor
+(+0.14 vs +0.24). A run's ~360 states are near duplicates, so heads memorise runs.
+(`python/offline_critic.py`.)
+
+`--lam-step` (default 1.0, the previous credit) sets the per-decision trace within a floor.
+Run `td1`: long2's checkpoint + `--lam-step 0.5`, no curriculum, D2_ seeds. Its first 20
+iterations are paired with the collect-only baseline (win 0.033 +- 0.003, a1 0.762 +- 0.011,
+a2 0.199 +- 0.010).
+
+#### A run critic that generalises: small, boss-aware, refit on past iterations
+
+The information for a run-level critic is in the state; the trunk head just memorises runs.
+A logistic model (`alphaslayer/unified/critic.py`) on act, floor, the 24 context features,
+the character, and the act boss per act, refit each iteration on the last 20 iterations and
+evaluated before it sees the current one, scores +0.145 Brier skill on win (+0.32 in act 3).
+The act boss decides most of it: act-3 runs facing the beatable boss won 45% (58/128), the
+other two 2-3%. With the boss id mis-encoded the same model scored +0.03, so the feature is
+what carries the value.
+
+Used as the run potential (P(win)), and therefore as an actor-critic baseline. How it enters
+fights matters:
+
+| fight potential = P(win fight) x ... (lam_step 0.5) | combat consistency | run consistency | combat direction vs hand |
+|---|---|---|---|
+| hand: w_act*(act+1) + 0.1*hp | 0.155 | 0.045 | 1 |
+| critic on the raw fight state | 0.61 | 0.15 | -0.28 +- 0.13 |
+| critic frozen at the fight's entry | 0.02 | 0.17 | n/a |
+| critic on the run state "if the fight ended now" | 0.41 | 0.16 | +0.60 +- 0.05 |
+
+Raw fight states let TD credit chase in-fight features the run does not keep (energy, block,
+turn), which made it consistent but pointed the wrong way. Freezing the potential at entry
+removed the in-fight HP signal. The fix is the entry decision's features with the fight's
+current hp, max hp and potion count (`fight_run_state`). That prices HP and potion spending at
+every action, at the scale of the post-fight value, so dragging a fight out earns nothing. Its
+remaining difference from the hand direction is expected: the critic prices HP by the
+situation (before a hard boss) instead of a flat 0.1. Whether that is closer to right is for
+win rates to settle: run `td2` = td1 + `--run-critic`, same checkpoint and seeds.
+
+td1's first 20 iterations vs the collect-only baseline, paired: win -0.002 +- 0.004, a1
+-0.001 +- 0.008, a2 -0.008 +- 0.008. No change yet; the policy had moved only KL 0.015 from
+its start.

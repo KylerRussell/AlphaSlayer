@@ -78,6 +78,8 @@ class Step:
     adv: float = 0.0                # shaped GAE advantage (policy)
     ret: float = 0.0                # unshaped lambda-return (value target); NaN = unknown
     act: int = 0
+    enc: object = None              # features._Dec from rollout time (reused by dataset.pack)
+    target: object = None           # fight search policy pi' over the legal choices (M9), or None
 
 
 def potential(kind: str, obs: dict, w_combat: float, w_hp: float, w_act: float = 0.0,
@@ -111,7 +113,7 @@ def act_of(kind: str, obs: dict) -> int:
 
 def compute_targets(steps: list, won: bool, gamma: float = 1.0, lam: float = 0.95,
                     v_end: float = 0.0, phi_end: float = 0.0, bootstrap: bool = True,
-                    mc_end: float | None = 0.0) -> None:
+                    mc_end: float | None = 0.0, lam_step: float = 1.0) -> None:
     """Fills adv (shaped, for the policy) and ret (value target).
 
     Reward is 1 on the last step of a won run, else 0. After the last step the potential is
@@ -123,6 +125,13 @@ def compute_targets(steps: list, won: bool, gamma: float = 1.0, lam: float = 0.9
     bootstrap=False: the value head is not used (V = 0 in every TD error), so advantages are
     lambda-discounted shaped credit plus the outcome. ret is the realised return plus
     ``mc_end`` (0 for a finished run; None when unknown, as in an isolated fight, giving NaN).
+
+    lam_step: the trace decay between two decisions on the SAME floor (lam applies per floor
+    advanced). 1 credits every decision of a fight with the fight's final result. Below 1,
+    combat credit becomes TD on the fight potential P(win this fight) * phi_run: an action is
+    judged by how it moved the fight head's estimate. On 20 iterations of long2 rollouts that
+    made the combat policy gradient 9x more consistent across batches (0.03 -> 0.28 mean
+    pairwise cosine at lam_step 0; python/grad_snr.py).
     """
     T = len(steps)
     if T == 0:
@@ -143,7 +152,7 @@ def compute_targets(steps: list, won: bool, gamma: float = 1.0, lam: float = 0.9
             phi_next = nxt.phi
             v_next = nxt.v if bootstrap else 0.0
         # lambda decays per floor advanced, not per decision (see the module docstring).
-        lk = 1.0 if last else (lam ** k if k > 0 else 1.0)
+        lk = 1.0 if last else (lam ** k if k > 0 else lam_step)
         v_here = s.v if bootstrap else 0.0
         delta_un = r + d * v_next - v_here
         delta_sh = delta_un + (d * phi_next - s.phi)
@@ -177,8 +186,11 @@ class RunBuffer:
     """Per-env open runs; closed runs become training steps with every target filled."""
 
     def __init__(self, gamma=1.0, lam=0.95, w_combat=0.0, w_hp=0.0, w_act=0.0, w_fight=0.0,
-                 bootstrap=True):
-        self.gamma, self.lam = gamma, lam
+                 bootstrap=True, lam_step=1.0, keep_obs=True):
+        self.gamma, self.lam, self.lam_step = gamma, lam, lam_step
+        # keep_obs=False drops a step's raw observation once it has its encoding (everything
+        # computed from obs is filled in here); the obs dicts were most of a 384-run buffer
+        self.keep_obs = keep_obs
         self.w_combat, self.w_hp, self.w_act, self.w_fight = w_combat, w_hp, w_act, w_fight
         self.bootstrap = bootstrap
         self.open: dict[int, list] = {}
@@ -186,8 +198,9 @@ class RunBuffer:
         self.done: list[Step] = []
         self.runs: list[dict] = []
 
-    def add(self, env, kind, obs, legal, a, logp, v, loop, p_fight=None):
-        st = Step(kind=kind, obs=obs, legal=legal, a=a, logp=logp, v=v, loop=loop,
+    def add(self, env, kind, obs, legal, a, logp, v, loop, p_fight=None, enc=None, target=None):
+        st = Step(kind=kind, obs=obs if (self.keep_obs or enc is None) else None, legal=legal,
+                  a=a, logp=logp, v=v, loop=loop, enc=enc, target=target,
                   floor=floor_of(kind, obs), act=act_of(kind, obs), p_fight=p_fight,
                   phi=potential(kind, obs, self.w_combat, self.w_hp, self.w_act,
                                 self.w_fight, p_fight))
@@ -212,7 +225,8 @@ class RunBuffer:
             st.act_clear = int(won or act_reached > st.act)
             st.reach_act3 = int(won or act_reached >= 2)
             st.floors_left = float(max(0, floors - st.floor))
-        compute_targets(steps, won, self.gamma, self.lam, bootstrap=self.bootstrap)
+        compute_targets(steps, won, self.gamma, self.lam, bootstrap=self.bootstrap,
+                        lam_step=self.lam_step)
         self.done.extend(steps)
         self.runs.append({"won": int(won), "act": act_reached, "floors": floors,
                           "n": len(steps)})
@@ -248,28 +262,33 @@ def group_mean(per_row: torch.Tensor, kind: torch.Tensor, run_weight: float = 0.
              with how often it occurs
       sqrt   kinds weighted by sqrt(count): in between
     """
-    is_c = kind == COMBAT
-    c = per_row[is_c].mean() if is_c.any() else None
-    ks = [k for k in kind.unique().tolist() if k != COMBAT]
-    r = None
-    if ks:
-        means = torch.stack([per_row[kind == k].mean() for k in ks])
-        if kind_weight == "equal":
-            r = means.mean()
-        else:
-            n = torch.tensor([float((kind == k).sum()) for k in ks], device=per_row.device,
-                             dtype=means.dtype)
-            w = n if kind_weight == "flat" else n.sqrt()
-            r = (means * w).sum() / w.sum()
-    if c is not None and r is not None:
-        return (1 - run_weight) * c + run_weight * r
-    return c if c is not None else (r if r is not None else per_row.sum() * 0)
+    # Per-kind sums and counts by index_add over the fixed kind list: no .unique(), no
+    # boolean indexing, no .item() -- the earlier version synchronised with the GPU several
+    # times per call, three calls per minibatch (6.6 s of a profiled 2-iteration run).
+    K = len(FT.DKINDS)
+    cnt = torch.zeros(K, device=per_row.device, dtype=per_row.dtype).index_add_(
+        0, kind, torch.ones_like(per_row))
+    sm = torch.zeros(K, device=per_row.device, dtype=per_row.dtype).index_add_(0, kind, per_row)
+    means = sm / cnt.clamp(min=1)
+    run_k = (cnt > 0) & (torch.arange(K, device=per_row.device) != COMBAT)
+    if kind_weight == "equal":
+        w = run_k.to(per_row.dtype)
+    elif kind_weight == "flat":
+        w = cnt * run_k
+    else:
+        w = cnt.sqrt() * run_k
+    r = (means * w).sum() / w.sum().clamp(min=1e-12)
+    c = means[COMBAT]
+    has_c, has_r = cnt[COMBAT] > 0, run_k.any()
+    zero = per_row.sum() * 0
+    return torch.where(has_c & has_r, (1 - run_weight) * c + run_weight * r,
+                       torch.where(has_c, c, torch.where(has_r, r, zero)))
 
 
 def ppo_loss(out: dict, tgt: dict, clip: float = 0.2, ent_coef: float = 0.01,
              vf_coef: float = 0.5, aux_coef: float = 0.25, run_weight: float = 0.5,
              anchor_logp: torch.Tensor | None = None, kl_coef: float = 0.0,
-             kind_weight: str = "equal", kl_run_mult: float = 1.0):
+             kind_weight: str = "equal", kl_run_mult: float = 1.0, distill_coef: float = 0.0):
     """PPO clipped surrogate + value BCE + aux + optional KL toward an anchor policy.
 
     tgt: a (B,) chosen action, old_logp (B,), adv (B,) already normalised, ret (B,) in [0,1],
@@ -326,7 +345,13 @@ def ppo_loss(out: dict, tgt: dict, clip: float = 0.2, ent_coef: float = 0.01,
                               run_weight, kind_weight) if kl_run_mult != 1.0 else parts["kl"])
     else:
         kl_term = zero
-    total = (parts["pg"] - ent_coef * parts["ent"] + vf_coef * parts["value"]
+    parts["distill"] = zero
+    if distill_coef > 0 and "searched" in tgt:
+        # rows without a target have search_p 0, so they add 0; no host sync
+        w = tgt["searched"].float()
+        ce = -(tgt["search_p"] * logp_all.masked_fill(~mask, 0.0)).sum(-1)
+        parts["distill"] = (ce * w).sum() / w.sum().clamp(min=1.0)
+    total = (distill_coef * parts["distill"] + parts["pg"] - ent_coef * parts["ent"] + vf_coef * parts["value"]
              + aux_coef * sum(parts[k] for k in ("act_clear", "reach_act3", "floors_left",
                                                  "fight_win", "fight_hp"))
              + kl_coef * kl_term)
@@ -334,6 +359,94 @@ def ppo_loss(out: dict, tgt: dict, clip: float = 0.2, ent_coef: float = 0.01,
         parts["clipfrac"] = ((ratio - 1).abs() > clip).float().mean()
         parts["approx_kl"] = (tgt["old_logp"] - logp).mean()
     return total, parts
+
+
+def seed_group_baseline(steps: list, runs: list) -> int:
+    """Subtracts, from every step's advantage, the leave-one-out mean advantage of the OTHER
+    plays of the same seed at the same floor and decision kind (``runs[i]["group"]`` = seed
+    group; runs are contiguous in ``steps`` in ``runs`` order). Returns the steps adjusted.
+
+    With several plays of one seed per iteration, much of a run's luck is shared: the map,
+    the events, the boss, the elite waiting on floor 12. Comparing a decision with what the
+    other plays of that seed experienced at the same point cancels that shared part. Each
+    other run counts once (its mean over the cell), and the baseline uses only OTHER runs, so
+    it is independent of this run's actions: the expected gradient is unchanged (as with
+    GRPO's group baseline, here per floor and kind instead of per whole trajectory).
+    """
+    cells: dict = {}
+    spans = []
+    o = 0
+    for ri, info in enumerate(runs):
+        n, g = info["n"], info.get("group", -1)
+        spans.append((o, o + n, g))
+        if g is not None and g >= 0:
+            for st in steps[o:o + n]:
+                d = cells.setdefault((g, st.floor, st.kind), {}).setdefault(ri, [0.0, 0])
+                d[0] += st.adv
+                d[1] += 1
+        o += n
+    # per cell: sum of per-run means and the number of runs
+    tot = {k: (sum(sm / c for sm, c in v.values()), len(v)) for k, v in cells.items()}
+    adjusted = 0
+    for ri, (a0, a1, g) in enumerate(spans):
+        if g is None or g < 0:
+            continue
+        for st in steps[a0:a1]:
+            key = (g, st.floor, st.kind)
+            total, nr = tot[key]
+            if nr < 2:
+                continue
+            sm, c = cells[key][ri]
+            st.adv -= (total - sm / c) / (nr - 1)
+            adjusted += 1
+    return adjusted
+
+
+class HistoryBaseline:
+    """Same-seed baseline from EARLIER iterations (Kyler's design, 2026-10-15).
+
+    A block of seeds is replayed for several iterations, each seed once per character per
+    iteration, so the policy learns between plays. A step's baseline is the mean advantage
+    that earlier plays of the same (seed group = seed x character) had at the same floor and
+    decision kind; each earlier run counts once (its mean over the cell). Earlier plays are
+    fixed history, independent of the current run's actions, so the baseline is unbiased
+    even though the policy has moved since; it only goes a little stale. The history resets
+    when the block changes.
+    """
+
+    def __init__(self, max_plays: int = 9):
+        self.block = None
+        self.hist: dict = {}            # (group, floor, kind) -> [per-run cell means], newest last
+        self.max_plays = max_plays
+
+    def apply(self, steps: list, runs: list, block) -> int:
+        if block != self.block:
+            self.block, self.hist = block, {}
+        cur: dict = {}                  # this iteration's per-run cell means (raw)
+        spans, o = [], 0
+        for ri, info in enumerate(runs):
+            n, g = info["n"], info.get("group", -1)
+            spans.append((o, o + n, g))
+            if g is not None and g >= 0:
+                for st in steps[o:o + n]:
+                    d = cur.setdefault((g, st.floor, st.kind), {}).setdefault(ri, [0.0, 0])
+                    d[0] += st.adv
+                    d[1] += 1
+            o += n
+        adjusted = 0
+        for a0, a1, g in spans:
+            if g is None or g < 0:
+                continue
+            for st in steps[a0:a1]:
+                h = self.hist.get((g, st.floor, st.kind))
+                if h:
+                    st.adv -= sum(h) / len(h)
+                    adjusted += 1
+        for key, per_run in cur.items():
+            lst = self.hist.setdefault(key, [])
+            lst.extend(sm / c for sm, c in per_run.values())
+            del lst[:-self.max_plays]
+        return adjusted
 
 
 def normalise_advantages(steps: list, center: str = "half", prior_n: float = 16.0) -> np.ndarray:

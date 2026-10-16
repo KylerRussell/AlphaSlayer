@@ -29,6 +29,7 @@ randomly, which trains the net to work at any depth.
 """
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -300,7 +301,23 @@ def choose_loops(trajectory: list, cand_mask, cap_rows, margin: float = 2.0,
 
 
 def to_torch(batch: dict, device) -> dict:
-    return {k: torch.from_numpy(v).to(device) for k, v in batch.items()}
+    """One host->device copy per dtype instead of one per array: ~32 small copies per batch
+    were ~1 ms of fixed overhead on ROCm."""
+    if torch.device(device).type == "cpu":
+        return {k: torch.from_numpy(v) for k, v in batch.items()}
+    groups: dict = {}
+    for k, v in batch.items():
+        groups.setdefault(v.dtype, []).append(k)
+    out = {}
+    for dt, keys in groups.items():
+        flat = np.concatenate([np.ascontiguousarray(batch[k]).reshape(-1) for k in keys])
+        dev_flat = torch.from_numpy(flat).to(device)
+        o = 0
+        for k in keys:
+            n = batch[k].size
+            out[k] = dev_flat[o:o + n].view(batch[k].shape)
+            o += n
+    return out
 
 
 def param_count(m: nn.Module) -> int:

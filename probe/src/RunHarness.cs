@@ -98,6 +98,42 @@ public sealed class RunHarness
         // the map. EnterAct() additionally fades and enters a MapRoom; both are node-only,
         // so this is the whole of act entry that matters headless.
         await RunManager.Instance.SetActInternal(0);
+        FightRestore.EnableCapture();
+    }
+
+    /// <summary>
+    /// Replaces the live run with the run as it was at the latest room entry, re-entering that
+    /// room (FightRestore). The engine's own load path (NGame.LoadRun) minus the scene: the
+    /// caller then re-applies its choices to get back to where it was.
+    /// </summary>
+    /// <summary>A fresh process's first run from a save (a run-search rollout).</summary>
+    public async Task StartFromSaveAsync(SerializableRun save)
+    {
+        TestMode.IsOn = true;
+        PreloadManager.Enabled = false;
+        await RestoreRoomEntryAsync(save);
+    }
+
+    public async Task RestoreRoomEntryAsync(SerializableRun save)
+    {
+        if (RunManager.Instance.DebugOnlyGetState() != null)
+        {
+            LeakFixes.BeforeTeardown();
+            try { RunManager.Instance.CleanUp(graceful: true); }
+            catch (Exception e) { Probe.Log($"  (non-fatal) CleanUp: {e.Message}"); }
+        }
+        RunState = RunState.FromSerializable(save);
+        Player = RunState.Players[0];
+        Character = Player.Character;
+        Acts = RunState.Acts.ToList();
+        await RunManager.Instance.SetUpSavedSingleplayer(RunState, save);
+        // A loaded run saves on room entry; ours never touch the profile.
+        HarmonyLib.Traverse.Create(RunManager.Instance).Property("ShouldSave").SetValue(false);
+        FightRestore.EnableCapture();
+        RunManager.Instance.Launch();
+        await RunManager.Instance.GenerateMap();
+        await RunManager.Instance.LoadIntoLatestMapCoord(AbstractRoom.FromSerializable(save.PreFinishedRoom, RunState));
+        LeakFixes.AfterRestore();
     }
 
     // ---------- map ----------

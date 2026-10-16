@@ -73,19 +73,46 @@ def tok(s) -> int:
     return zlib.crc32(str(s).encode("utf-8")) % (TOKENS - 1) + 1
 
 
+_SYMLOG_INT: dict = {}
+
+
 def symlog(x) -> float:
+    # Memoised for ints (nearly every input: hp, block, counts, card values). Called ~25x per
+    # card, it was the hottest function in a profile of the trainer.
+    if type(x) is int:
+        v = _SYMLOG_INT.get(x)
+        if v is None:
+            v = math.copysign(math.log1p(abs(x)), x)
+            if len(_SYMLOG_INT) < 100_000:
+                _SYMLOG_INT[x] = v
+        return v
     x = float(x or 0)
     return math.copysign(math.log1p(abs(x)), x)
 
 
+_SLOT_IX = {k: i for i, k in enumerate(VALUE_SLOTS)}
+
+
 def _vals(d) -> list:
-    d = d or {}
-    return [symlog(d.get(k, 0)) for k in VALUE_SLOTS]
+    # Zeros except the slots present: a card's value dict holds a few of the slots.
+    out = [0.0] * len(VALUE_SLOTS)
+    if d:
+        for k, v in d.items():
+            j = _SLOT_IX.get(k)
+            if j is not None and v:
+                out[j] = symlog(v)
+    return out
+
+
+_KW_CACHE: dict = {}
 
 
 def _kw(m) -> list:
     m = int(m or 0)
-    return [float((m >> b) & 1) for b in range(KW_BITS)]
+    v = _KW_CACHE.get(m)
+    if v is None:
+        v = _KW_CACHE[m] = [float((m >> b) & 1) for b in range(KW_BITS)]
+    return list(v)
 
 
 def _i(x, default=0) -> int:
@@ -431,12 +458,16 @@ def _pad(rows, width, dtype, fill=0):
     return out, mask
 
 
-def encode_batch(decisions, vocab: Vocab, trunc: dict | None = None) -> dict:
-    """decisions: iterable of (kind, obs, legal). Returns padded numpy arrays."""
+def encode_batch(decisions, vocab: Vocab, trunc: dict | None = None, keep: list | None = None) -> dict:
+    """decisions: iterable of (kind, obs, legal). Returns padded numpy arrays. ``keep``, if
+    given, receives each decision's encoding, so the trainer can pack it for the update
+    without encoding the same observation a second time."""
     trunc = trunc if trunc is not None else {k: 0 for k in CAPS}
     for k in CAPS:
         trunc.setdefault(k, 0)
     ds = [encode_one(k, o, l, vocab, trunc) for k, o, l in decisions]
+    if keep is not None:
+        keep.extend(ds)
     B = len(ds)
     out = {
         "ctx_ids": np.array([d.ctx_ids for d in ds], dtype=np.int64),

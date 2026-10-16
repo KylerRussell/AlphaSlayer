@@ -372,5 +372,24 @@ public sealed class CombatHarness
         CombatManager.Instance.IsOverOrEnding && !CombatManager.Instance.IsStarting;
 
     /// <summary>A real suspension that lets the engine's continuations drain.</summary>
-    public static Task Suspend() => Task.Delay(1);
+    public static Task Suspend()
+    {
+        Suspends++;
+        return FrameSuspend ? NextFrame() : Task.Delay(1);
+    }
+
+    /// <summary>Suspend for one engine frame instead of a 1 ms timer (which under load sleeps
+    /// for a scheduler slice). Set only while searching (--probe-search-frame-suspend): a
+    /// replayed choice waited ~0.7 ms per choice on the timer, about half its cost.</summary>
+    public static bool FrameSuspend;
+
+    private static async Task NextFrame()
+    {
+        var tree = NGame.Instance?.GetTreeOrNull();
+        if (tree == null) { await Task.Delay(1); return; }
+        await tree.ToSignal(tree, SceneTree.SignalName.ProcessFrame);
+    }
+
+    /// <summary>Suspend() calls so far (search/replay profiling).</summary>
+    public static long Suspends;
 }

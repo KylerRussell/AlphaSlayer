@@ -276,7 +276,10 @@ public static class Episodes
             if (CombatHarness.Finished()) return player.Creature.IsDead ? "player_dead" : "enemies_cleared";
 
             var pcs = player.PlayerCombatState;
-            if (pcs != null && pcs.Phase == PlayerTurnPhase.Play && st.CurrentSide == CombatSide.Player)
+            // One-frame polling (search) sees a card still on its way out of the play pile
+            // (to the exhaust or discard) that 1 ms polling never caught: not a decision yet.
+            if (pcs != null && pcs.Phase == PlayerTurnPhase.Play && st.CurrentSide == CombatSide.Player
+                && !(CombatHarness.FrameSuspend && !Settled(pcs)))
                 return null;
             await CombatHarness.Suspend();
         }
@@ -312,6 +315,12 @@ public static class Episodes
             if (RunManager().ActionQueueSet.IsEmpty) return;
         }
     }
+
+    /// <summary>Nothing left in flight: no card in the play pile, no queued or running action
+    /// (turn-start relic powers, a card's move to the exhaust/discard).</summary>
+    private static bool Settled(PlayerCombatState pcs) =>
+        pcs.PlayPile.Cards.Count == 0 && RunManager().ActionQueueSet.IsEmpty
+        && !RunManager().ActionExecutor.IsRunning;
 
     private static async Task<string> WaitForTurn(Player player, int minTurn)
     {

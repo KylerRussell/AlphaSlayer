@@ -109,6 +109,13 @@ public static class RunRewards
     /// </summary>
     public static Func<Player, IReadOnlyList<CardRewardOption>, Task<List<CardRewardOption>>> ChooseCard;
 
+    /// <summary>
+    /// Answers a card prompt that a reward raises (CardRemovalReward picks a card from the
+    /// deck). Null finishes the prompt empty. Without a driver here the reward parked on the
+    /// prompt forever: the game wedged mid-run (the Necrobinder/Silent stalls of 2026-10-15).
+    /// </summary>
+    public static Func<PendingSelection, Task> AnswerSelection;
+
     private static readonly List<Func<IReadOnlyList<CardCreationResult>, IReadOnlyList<CardRewardAlternative>, CardRewardSelection>> _cardAnswers = new();
 
     /// <summary>
@@ -180,7 +187,9 @@ public static class RunRewards
             if (isCard) _cardAnswers.Add(await BuildCardAnswer(player, (CardReward)reward));
             try
             {
-                await sync.SelectLocalReward(reward);
+                // A reward can park on a card prompt (remove a card from the deck); drive it,
+                // as events and shops do, or nothing ever answers it.
+                await RunRooms.DriveWithSelections(sync.SelectLocalReward(reward), AnswerSelection);
                 Count(options[i].Kind, reward.SuccessfullySelected ? 1 : 2);
             }
             catch (Exception e)

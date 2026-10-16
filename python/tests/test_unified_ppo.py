@@ -316,5 +316,151 @@ check("within a kind, differences are unchanged (same scale)",
 check("a kind seen once is shrunk toward the half mean, not zeroed", kind[-1] > 1.0, f"{kind[-1]:.2f}")
 check("the combat half is untouched by run kinds", np.allclose(kind[:200], half[:200], atol=1e-6))
 
+print("\n== group_mean (sync-free) matches the reference implementation")
+def group_mean_ref(per_row, kind, run_weight=0.5, kind_weight="equal"):
+    is_c = kind == P.COMBAT
+    c = per_row[is_c].mean() if is_c.any() else None
+    ks = [k for k in kind.unique().tolist() if k != P.COMBAT]
+    r = None
+    if ks:
+        means = torch.stack([per_row[kind == k].mean() for k in ks])
+        if kind_weight == "equal":
+            r = means.mean()
+        else:
+            n = torch.tensor([float((kind == k).sum()) for k in ks], dtype=means.dtype)
+            w = n if kind_weight == "flat" else n.sqrt()
+            r = (means * w).sum() / w.sum()
+    if c is not None and r is not None:
+        return (1 - run_weight) * c + run_weight * r
+    return c if c is not None else (r if r is not None else per_row.sum() * 0)
+g_ = torch.Generator().manual_seed(0)
+worst = 0.0
+for trial in range(60):
+    n_ = int(torch.randint(1, 40, (1,), generator=g_))
+    mode = trial % 3
+    kinds_ = torch.randint(0, len(FT.DKINDS), (n_,), generator=g_)
+    if mode == 1:
+        kinds_[:] = P.COMBAT                      # combat only
+    elif mode == 2:
+        kinds_[kinds_ == P.COMBAT] = (P.COMBAT + 1) % len(FT.DKINDS)   # run only
+    x_ = torch.randn(n_, generator=g_, dtype=torch.float64)
+    for kw in ("equal", "flat", "sqrt"):
+        worst = max(worst, abs(float(P.group_mean(x_, kinds_, 0.3, kw) - group_mean_ref(x_, kinds_, 0.3, kw))))
+check("equal / flat / sqrt agree on 60 random batches (incl. combat-only and run-only)",
+      worst < 1e-9, f"max |diff| {worst:.2e}")
+x_ = torch.randn(10, dtype=torch.float64, requires_grad=True)
+P.group_mean(x_, torch.randint(0, len(FT.DKINDS), (10,)), 0.5, "flat").backward()
+check("gradients are finite", bool(torch.isfinite(x_.grad).all()))
+
+print("\n== seed-group baseline (leave-one-out, per seed x floor x kind)")
+from types import SimpleNamespace as NS2
+def run_(adv_by_step):     # [(floor, kind, adv), ...]
+    return [NS2(floor=f, kind=k, adv=a) for f, k, a in adv_by_step]
+r0 = run_([(1, "travel", 1.0), (2, "combat", 0.5), (2, "combat", 1.5)])   # group 0
+r1 = run_([(1, "travel", 3.0), (2, "combat", 2.0)])                       # group 0
+r2 = run_([(1, "travel", 5.0), (3, "rest", 7.0)])                         # group 0
+r3 = run_([(1, "travel", 9.0)])                                           # group 1, alone
+r4 = run_([(1, "travel", 4.0)])                                           # no group
+steps_ = r0 + r1 + r2 + r3 + r4
+runs_ = [{"n": 3, "group": 0}, {"n": 2, "group": 0}, {"n": 2, "group": 0},
+         {"n": 1, "group": 1}, {"n": 1, "group": -1}]
+P.seed_group_baseline(steps_, runs_)
+check("travel@1: each play minus the mean of the OTHER two plays of its seed",
+      close(r0[0].adv, 1 - 4) and close(r1[0].adv, 3 - 3) and close(r2[0].adv, 5 - 2),
+      f"{r0[0].adv} {r1[0].adv} {r2[0].adv}")
+check("a run counts once per cell: r0's two fight steps (mean 1.0) vs r1's 2.0",
+      close(r0[1].adv, 0.5 - 2.0) and close(r0[2].adv, 1.5 - 2.0) and close(r1[1].adv, 2.0 - 1.0))
+check("a cell no other play reached is left alone (rest@3)", close(r2[1].adv, 7.0))
+check("a seed played once, and a run without a group, are untouched",
+      close(r3[0].adv, 9.0) and close(r4[0].adv, 4.0))
+
+print("\n== history baseline (earlier plays of the same seed x character)")
+hb = P.HistoryBaseline(max_plays=2)
+def play(adv_travel, adv_fights, group=3):
+    st = [NS2(floor=1, kind="travel", adv=adv_travel)] + [NS2(floor=2, kind="combat", adv=x) for x in adv_fights]
+    return st, [{"n": len(st), "group": group}]
+s1, r1_ = play(1.0, [0.5, 1.5])
+hb.apply(s1, r1_, block=0)
+check("first play of a seed: nothing to compare with, untouched",
+      close(s1[0].adv, 1.0) and close(s1[1].adv, 0.5))
+s2, r2_ = play(3.0, [2.0])
+hb.apply(s2, r2_, block=0)
+check("second play: minus the first play's cell means (a run counts once: fights mean 1.0)",
+      close(s2[0].adv, 3.0 - 1.0) and close(s2[1].adv, 2.0 - 1.0))
+s3, r3_ = play(5.0, [0.0])
+hb.apply(s3, r3_, block=0)
+check("third: minus the mean of BOTH earlier plays, raw (not their adjusted values)",
+      close(s3[0].adv, 5.0 - 2.0) and close(s3[1].adv, 0.0 - 1.5))
+s4, r4_ = play(7.0, [0.0])
+hb.apply(s4, r4_, block=0)
+check("history keeps the last max_plays plays", close(s4[0].adv, 7.0 - 4.0))
+s5, r5_ = play(9.0, [0.0], group=4)
+hb.apply(s5, r5_, block=0)
+check("another seed x character group has its own history", close(s5[0].adv, 9.0))
+s6, r6_ = play(9.0, [0.0])
+hb.apply(s6, r6_, block=1)
+check("a new block starts with no history", close(s6[0].adv, 9.0))
+
+print("\n== per-decision trace within a floor (lam_step)")
+# A 3-decision fight on floor 2 (fight potentials 0.30 -> 0.50 -> 0.20), won, then a run
+# decision on floor 3 with potential 0.60, then the run is lost there. lam (per floor) = 0.8.
+def fight3(lam_step):
+    s = [mk("combat", 2, 0.0, 0.30), mk("combat", 2, 0.0, 0.50), mk("combat", 2, 0.0, 0.20),
+         mk("travel", 3, 0.0, 0.60)]
+    P.compute_targets(s, False, 1.0, 0.8, bootstrap=False, lam_step=lam_step)
+    return [x.adv for x in s]
+d1 = fight3(1.0)
+s_old = [mk("combat", 2, 0.0, 0.30), mk("combat", 2, 0.0, 0.50), mk("combat", 2, 0.0, 0.20),
+         mk("travel", 3, 0.0, 0.60)]
+P.compute_targets(s_old, False, 1.0, 0.8, bootstrap=False)
+check("lam_step=1 is the previous credit exactly", all(close(a, b.adv) for a, b in zip(d1, s_old)))
+d0 = fight3(0.0)
+check("lam_step=0: each fight decision is credited by the potential change it caused (TD(0))",
+      close(d0[0], 0.50 - 0.30) and close(d0[1], 0.20 - 0.50), f"{d0[0]:+.3f} {d0[1]:+.3f}")
+check("...the fight's last decision still bootstraps across the floor with lam (0.8)",
+      close(d0[2], (0.60 - 0.20) + 0.8 * (0.0 - 0.60)), f"{d0[2]:+.3f}")
+dh = fight3(0.5)
+check("lam_step=0.5 mixes: A_t = delta_t + 0.5 * A_t+1 within the floor",
+      close(dh[0], 0.20 + 0.5 * dh[1]) and close(dh[1], -0.30 + 0.5 * dh[2]))
+buf_ = P.RunBuffer(lam=0.8, lam_step=0.0)
+check("RunBuffer passes lam_step through", buf_.lam_step == 0.0)
+
+print("\n== M9: search policy pi' and its distillation")
+from alphaslayer.unified import search as SR
+lp_ = np.log(np.array([0.5, 0.3, 0.15, 0.05]))
+q_ = [0.40, 0.42, -1e9, -1e9]
+t_hot = SR.improved(lp_, q_, 1e-4)
+t_cold = SR.improved(lp_, q_, 1e4)
+check("pi' is 0 on choices the search did not simulate", t_hot[2] == 0 and t_hot[3] == 0 and t_cold[2] == 0)
+check("tau -> 0: pi' is the best simulated choice", t_hot.argmax() == 1 and t_hot[1] > 0.999)
+check("tau -> inf: pi' is the prior renormalised over the simulated choices",
+      close(float(t_cold[0]), 0.5 / 0.8, 1e-3) and close(float(t_cold[1]), 0.3 / 0.8, 1e-3))
+check("nothing simulated -> no target", SR.improved(lp_, [-1e9] * 4, 0.01) is None)
+
+logits_ = out["logits"].detach().clone().requires_grad_(True)
+out_d = dict(out, logits=logits_)
+is_c = (tgt["kind"] == P.COMBAT)
+srch = is_c.clone()
+srch[torch.nonzero(is_c)[0]] = False                 # one combat row stays unsearched
+sp = torch.zeros_like(out["logits"])
+for j in torch.nonzero(srch).flatten().tolist():
+    n_ = int(b["cand_mask"][j].sum())
+    w_ = torch.rand(n_, dtype=torch.float64)
+    sp[j, :n_] = w_ / w_.sum()
+tgt_d = dict(tgt, searched=srch, search_p=sp, adv=torch.zeros(24, dtype=torch.float64))
+tot0, _ = P.ppo_loss(out_d, tgt_d, distill_coef=0.0)
+tot1, pd = P.ppo_loss(out_d, tgt_d, distill_coef=1.0)
+lp_all_ = torch.log_softmax(out["logits"], -1).masked_fill(~b["cand_mask"], 0.0)
+ce_ = float((-(sp * lp_all_).sum(-1))[srch].mean())
+check("distill = mean CE(pi', pi) over the searched rows", close(float(pd["distill"]), ce_, 1e-9),
+      f"{float(pd['distill']):.6f} vs {ce_:.6f}")
+check("distill_coef adds exactly coef * distill", close(float(tot1 - tot0), float(pd["distill"]), 1e-9))
+g_ = torch.autograd.grad(pd["distill"], logits_)[0]
+p_ = torch.softmax(out["logits"], -1)
+exp_g = ((p_ - sp) * srch.unsqueeze(1)).masked_fill(~b["cand_mask"], 0.0) / int(srch.sum())
+check("its gradient is (pi - pi') / n on searched rows and 0 elsewhere",
+      float((g_.masked_fill(~b["cand_mask"], 0.0) - exp_g).abs().max()) < 1e-9 and
+      float(g_[~srch].masked_fill(~b["cand_mask"][~srch], 0.0).abs().max()) == 0.0)
+
 print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILED: {FAILS}'}")
 sys.exit(1 if FAILS else 0)

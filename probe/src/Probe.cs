@@ -93,6 +93,11 @@ public static class Probe
         // Headless text measurement faults on freed text-server resources; it affects no rules.
         if (!HasFlag("probe-no-text-suppress")) TextSuppress.Install();
 
+        // Leaks that slow a long-lived process down (headless audio nodes, a restore's
+        // NetCombatCardDb subscriptions): see LeakFixes.
+        try { LeakFixes.Install(); }
+        catch (Exception e) { Log($"leak fixes FAILED: {e}"); }
+
         // Turn unguarded scene lookups into null instead of a walk through freed native
         // memory. See NodeGuard for why this is a crash rather than an exception.
         if (!HasFlag("probe-no-node-guard"))
@@ -431,6 +436,7 @@ public static class Probe
 
     private static async Task OneFrame()
     {
+        OneFrames++;
         if (YieldMode == "delay") { await Task.Delay(1); return; }
 
         // Hybrid. Awaiting SceneTree.ProcessFrame is cheap and unwinds for shallow chains, but
@@ -444,6 +450,9 @@ public static class Probe
         if (tree == null) { await Task.Delay(1); return; }
         await tree.ToSignal(tree, SceneTree.SignalName.ProcessFrame);
     }
+
+    /// <summary>OneFrame() calls so far (search/replay profiling).</summary>
+    public static long OneFrames;
 
     public static string YieldMode = "frame";
     public static int DelayEvery = 64;

@@ -75,7 +75,10 @@ def run_key(run_id: str) -> float:
 def pack(records: list, vocab: FT.Vocab) -> dict:
     """Encodes decisions into ragged arrays + per-decision targets."""
     trunc = {k: 0 for k in FT.CAPS}
-    decs = [FT.encode_one(r["kind"], r["obs"], r["legal"], vocab, trunc) for r in records]
+    # A record may carry its encoding from rollout time (encode_one is a pure function of
+    # kind/obs/legal, so it is the same object a fresh encode would build).
+    decs = [r["enc"] if r.get("enc") is not None
+            else FT.encode_one(r["kind"], r["obs"], r["legal"], vocab, trunc) for r in records]
     out = {"ctx_ids": np.array([d.ctx_ids for d in decs], np.int64).reshape(-1, 7),
            "ctx_f": np.array([d.ctx_f for d in decs], np.float32).reshape(-1, FT.F_CTX)}
     for g, fields in GROUPS.items():

@@ -68,6 +68,12 @@ class _Conn:
         except OSError:
             self.alive = False
 
+    def send_json(self, msg: dict):
+        try:
+            self.sock.sendall(json.dumps(msg).encode() + b"\n")
+        except OSError:
+            self.alive = False
+
     def close(self):
         try:
             self.sock.close()

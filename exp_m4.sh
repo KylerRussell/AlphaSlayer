@@ -17,7 +17,9 @@ LOG=$ROOT/logs/m4_$TAG.log
 OUT=unified_m4_$TAG.pt
 cd "$ROOT/python"
 export XDG_DATA_HOME="$("$ROOT/headless_home.sh" 2>/dev/null)"
-export PYTHONHASHSEED=0 HIP_VISIBLE_DEVICES=0 HSA_ENABLE_SDMA=0 PYTHONPATH=.
+# GPU 1 = the second 7900 XT (PCI 11:00.0, no displays), the default; 0 drives the monitors
+# (03:00.0) and train_unified refuses it (alphaslayer/gpu_guard.py: 4 desktop-killing resets).
+export PYTHONHASHSEED=0 HIP_VISIBLE_DEVICES=${GPU:-1} HSA_ENABLE_SDMA=0 PYTHONPATH=.
 
 done_iters() {
   $PY - "$OUT" <<'EOF' 2>/dev/null || echo 0
@@ -37,7 +39,11 @@ for attempt in $(seq 1 30); do
       >> "$LOG" 2>&1
   code=$?
   echo "=== attempt $attempt exited code=$code at $(date '+%m-%d %H:%M') ===" >> "$LOG"
-  pkill -9 -x SlayTheSpire2 2>/dev/null
+  # Only probe-launched games, and only when no other trainer (another arm) is still running:
+  # a bare pkill killed the other arm's games and would kill a game Kyler is playing.
+  # POOL_PATTERN narrows it to this arm's game copy (e.g. sts2_testgame3/SlayTheSpire2) so an
+  # eval running beside it on another copy keeps its games.
+  pgrep -f "[t]rain_unified.py" >/dev/null || pkill -9 -f -- "${POOL_PATTERN:---probe=runserve}" 2>/dev/null
   [ "$code" -eq 0 ] && continue
   sleep 30
 done
