@@ -37,7 +37,8 @@ public sealed class PendingSelection
     public void Finish()
     {
         if (CardSelect.Pending == this) CardSelect.Pending = null;
-        Tcs.TrySetResult(Chosen.ToList());
+        if (CardDbDiag.SelectTrace) Probe.Log($"SELTRACE finish n={Chosen.Count} {CardDbDiag.Where(Chosen.FirstOrDefault() ?? Options.FirstOrDefault())}");
+        if (Tcs.TrySetResult(Chosen.ToList())) CardSelect.Resolved();
     }
 }
 
@@ -93,8 +94,30 @@ public sealed class CardSelect : ICardSelector
 
     public static void Reset()
     {
-        Pending?.Tcs.TrySetResult(Array.Empty<CardModel>());
+        if (Pending != null && CardDbDiag.SelectTrace) Probe.Log($"SELTRACE reset {CardDbDiag.Where(Pending.Options.FirstOrDefault())}");
+        if (Pending?.Tcs.TrySetResult(Array.Empty<CardModel>()) == true)
+        {
+            Abandoned++;
+            Resolved();
+        }
         Pending = null;
+    }
+
+    /// <summary>Selections Reset answered (empty) while game code was parked on them.</summary>
+    public static long Abandoned;
+    private static bool _resolved;
+
+    /// <summary>A parked selection was answered: the game code awaiting it resumes on a LATER
+    /// frame (RunContinuationsAsynchronously), e.g. Entropy's transform after a search rollout
+    /// picked the card and the search restores right after.</summary>
+    internal static void Resolved() => _resolved = true;
+
+    /// <summary>Whether a selection was answered since the last call (Probe.DrainGameWaitsAsync).</summary>
+    public static bool TakeResolved()
+    {
+        var r = _resolved;
+        _resolved = false;
+        return r;
     }
 
     public Task<IEnumerable<CardModel>> GetSelectedCards(
@@ -120,6 +143,7 @@ public sealed class CardSelect : ICardSelector
                 TaskCreationOptions.RunContinuationsAsynchronously),
         };
         Pending = p;
+        if (CardDbDiag.SelectTrace) Probe.Log($"SELTRACE raise n={list.Count} min={min} max={max} {CardDbDiag.Where(list[0])}");
         _raised.TrySetResult(true);
         return p.Tcs.Task;
     }

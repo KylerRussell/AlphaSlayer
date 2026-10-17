@@ -97,6 +97,10 @@ public static class Probe
         // NetCombatCardDb subscriptions): see LeakFixes.
         try { LeakFixes.Install(); }
         catch (Exception e) { Log($"leak fixes FAILED: {e}"); }
+        try { StaleCombat.Install(); }
+        catch (Exception e) { Log($"stale combat guard FAILED: {e}"); }
+        try { CardDbDiag.Install(); }
+        catch (Exception e) { Log($"card db diag FAILED: {e}"); }
 
         // Turn unguarded scene lookups into null instead of a walk through freed native
         // memory. See NodeGuard for why this is a crash rather than an exception.
@@ -412,15 +416,65 @@ public static class Probe
         if (!System.Runtime.CompilerServices.RuntimeHelpers.TryEnsureSufficientExecutionStack())
         {
             _yields++;
-            __result = OneFrame();
+            __result = GameFrame();
             return false;
         }
 
         var every = YieldEvery;
         __result = (every > 0 && ++_waitCount % every == 0)
-            ? OneFrame()
+            ? GameFrame()
             : Task.CompletedTask;
         return false;
+    }
+
+    /// <summary>Bumped at the start of every fight restore (RunHarness.RestoreRoomEntryAsync).</summary>
+    public static int RestoreGen;
+
+    /// <summary>Game waits suspended right now (GameFrame), and drain statistics.</summary>
+    public static int PendingGameWaits;
+    public static long StaleResumed, DrainFrames, DrainCapHits, StuckSelects;
+
+    private static readonly bool FreezeStale = HasFlag("probe-freeze-stale");
+
+    /// <summary>
+    /// A game wait (one real frame). Counted while suspended so a fight restore can first let
+    /// the old combat's in-flight continuations finish (DrainGameWaitsAsync): resumed AFTER the
+    /// restore, an orb passive or a death animation runs against the torn-down or the NEW
+    /// combat, and in this process a null dereference in game code is a SIGSEGV, not an
+    /// exception (LightningOrb.Passive -> Hook.ModifyOrbValue; ReattachPower fade-out).
+    /// StaleResumed counts the ones that still resumed after a restore. --probe-freeze-stale
+    /// parks those for good instead (it can deadlock: a parked chain may hold what the new
+    /// combat waits for).
+    /// </summary>
+    private static async Task GameFrame()
+    {
+        var gen = RestoreGen;
+        PendingGameWaits++;
+        try { await OneFrame(); }
+        finally { PendingGameWaits--; }
+        if (gen != RestoreGen)
+        {
+            StaleResumed++;
+            if (FreezeStale) await new TaskCompletionSource().Task;
+        }
+    }
+
+    /// <summary>Before a teardown: run frames until no game wait is suspended (the old
+    /// combat's continuations finish in the old combat, as in normal play), at most cap.</summary>
+    public static async Task DrainGameWaitsAsync(int cap)
+    {
+        // A selection just answered (picked by a rollout, or abandoned by CardSelect.Reset)
+        // resumes its game code (Hologram's OnPlay then the card's enchantments, Entropy's
+        // transform...) on a later frame, before it can reach a counted wait: give it a few
+        // frames, or it resumes after the teardown against a dead combat.
+        var min = CardSelect.TakeResolved() ? 3 : 0;
+        for (var i = 0; i < cap; i++)
+        {
+            if (i >= min && PendingGameWaits <= 0) return;
+            DrainFrames++;
+            await CombatHarness.Suspend();
+        }
+        if (PendingGameWaits > 0) DrainCapHits++;
     }
 
     public static int _yields;

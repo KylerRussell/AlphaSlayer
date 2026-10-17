@@ -82,6 +82,10 @@ def main():
     ap.add_argument("--envs", type=int, default=24)
     ap.add_argument("--runs-per-env", type=int, default=4)
     ap.add_argument("--eval-iters", type=int, default=5)
+    ap.add_argument("--loud", action="store_true", help="game stdout/stderr to this process (native crashes)")
+    ap.add_argument("--only-runs", default="", help="comma-separated run ids to play (repro one seed)")
+    ap.add_argument("--job", default="", help="repro training runs: SEED:CHARACTER,... (ids 1..n)")
+    ap.add_argument("--sample", action="store_true", help="live runs sample the policy (repro training)")
     ap.add_argument("--pick", choices=["argmax", "margin", "prior"], default="argmax",
                     help="argmax: highest leaf value; margin: override the policy only by > --margin; "
                          "prior: argmax log pi + q / --tau")
@@ -110,7 +114,7 @@ def main():
     if a.graphs:
         from alphaslayer.unified.graphrun import GraphRunner
         graphs = GraphRunner(net, dev)
-    greedy = make_policy(net, vocab, dev, True, "1", lambda *x: None, greedy=True, graphs=graphs)
+    greedy = make_policy(net, vocab, dev, True, "1", lambda *x: None, greedy=not a.sample, graphs=graphs)
     picks = collections.Counter()
     dump = open(a.dump, "w") if a.dump else None
 
@@ -186,11 +190,18 @@ def main():
     per_run, res_all = [], []
     t0 = time.time()
     with RunPool(n_envs=a.slots, game_dir=os.path.abspath(a.game), out_dir=a.out, act_cap=3,
-                 extra_args=extra, recycle_runs=25, batch_timeout=a.batch_timeout) as pool:
+                 extra_args=extra, recycle_runs=25, batch_timeout=a.batch_timeout, quiet=not a.loud) as pool:
         for e in range(1, a.eval_iters + 1):
             jobs = [{"run": e * 100000 + r * 1000 + i, "seed": f"EV_{e}_{i}{e * 1000 + r}",
                      "character": CHARS[i % len(CHARS)]}
                     for r in range(a.runs_per_env) for i in range(a.envs)]
+            if a.job:
+                jobs = [{"run": e * 100000 + n + 1, "seed": j.rsplit(":", 1)[0], "character": j.rsplit(":", 1)[1]}
+                        for n, j in enumerate(a.job.split(","))]
+            if a.only_runs:
+                jobs = [j for j in jobs if str(j["run"]) in a.only_runs.split(",")]
+                if not jobs:
+                    continue
             by_run = {j["run"]: j for j in jobs}
             pool.run(jobs, policy, deadline_s=a.deadline, search=search, run_search=rsr,
                      on_restart=lambda i: None)

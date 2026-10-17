@@ -18,6 +18,6 @@ echo "===== $NAME $(date +%T)"
 .venv7/bin/python search_eval.py --ckpt unified_m4_td2_it50.pt --game ${GAME:-data/sts2_testgame3} --slots ${SLOTS:-22} \
   --rooms "" --run-search "$KINDS" --run-k 3 --deck-plays 8 --worlds 4 --boss-plays 2 --max-live ${MAX_LIVE:-6} \
   --deadline 36000 --name "$NAME" --run-dump ../logs/${NAME}.jsonl --out /tmp/alphaslayer_rsearch_ "$@" 2>&1 \
-  | grep -v amdgpu.ids
+  | grep --line-buffered -v amdgpu.ids
 .venv7/bin/python pair_evals.py $REF ../logs/eval_runs/${NAME}_g.json | tail -4
 echo "===== done $(date +%T)"

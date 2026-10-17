@@ -11,6 +11,6 @@ NAME=${NAME:-search_td2_be_turn_k4s2_prior0.01}
 echo "===== $NAME $(date +%T)"
 .venv7/bin/python search_eval.py --ckpt unified_m4_td2_it50.pt --game ${GAME:-data/sts2_testgame2} --slots ${SLOTS:-22} \
   --mode turn --rooms Elite,Boss --k 4 --samples 2 --pick prior --tau 0.01 \
-  --name "$NAME" --dump ../logs/${NAME}.jsonl "$@" 2>&1 | grep -v amdgpu.ids
+  --name "$NAME" --dump ../logs/${NAME}.jsonl "$@" 2>&1 | grep --line-buffered -v amdgpu.ids
 .venv7/bin/python pair_evals.py $REF ../logs/eval_runs/${NAME}_g.json | tail -4
 echo "===== done $(date +%T)"

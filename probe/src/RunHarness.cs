@@ -116,6 +116,26 @@ public sealed class RunHarness
 
     public async Task RestoreRoomEntryAsync(SerializableRun save)
     {
+        if (!Probe.HasFlag("probe-no-drain"))
+        {
+            var cap = Probe.ArgInt("probe-drain-cap", 120);
+            await Probe.DrainGameWaitsAsync(cap);
+            // The drained code can go on to raise a NEW selection (the turn continues: Entropy's
+            // pick at turn start). Abandon that too while its combat is alive; left pending, the
+            // restored fight's loop answers it and Entropy transforms a dead combat's card.
+            for (var k = 0; k < 5 && CardSelect.Pending != null; k++)
+            {
+                CardSelect.Reset();
+                await Probe.DrainGameWaitsAsync(cap);
+            }
+            if (CardSelect.Pending != null)
+            {
+                CardSelect.Pending = null;       // still raising: leave its code parked for good
+                Probe.StuckSelects++;
+            }
+            CardSelect.ClearRaised();
+        }
+        Probe.RestoreGen++;
         if (RunManager.Instance.DebugOnlyGetState() != null)
         {
             LeakFixes.BeforeTeardown();

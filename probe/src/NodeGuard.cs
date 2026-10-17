@@ -145,6 +145,12 @@ public static class NodeGuard
         // where the very next line of the same class uses `?.` correctly. Sets a death
         // animation; nothing downstream of it is a rule.
         "MegaCrit.Sts2.Core.Models.Monsters.SoulNexus:AfterDeath:MegaCrit.Sts2.Core.Entities.Creatures.Creature",
+        // Decimillipede: ReattachPower.AfterDeath waits 0.25 s after the last segment dies, then
+        // this hides intents and plays the death VFX on the creature nodes. Resumed after a
+        // fight restore (search) it reads CombatState.Enemies of the torn-down combat: null,
+        // and the interface call faults inside a dispatch stub - SIGSEGV, not an exception
+        // (deterministic per seed, ~1% of runs with elite search). Scene nodes only.
+        "MegaCrit.Sts2.Core.Models.Powers.ReattachPower:DoFadeOutOnAllSegments",
     };
 
     /// <summary>

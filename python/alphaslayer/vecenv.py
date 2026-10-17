@@ -91,6 +91,8 @@ def game_preexec():
     compresses and stores, and none of them are ours to debug. A crash still surfaces as a
     non-zero exit code, which VecRunEnv logs.
     """
+    if os.environ.get("ALPHASLAYER_CORE"):     # debugging a crash: keep its core
+        return
     try:
         import resource
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))

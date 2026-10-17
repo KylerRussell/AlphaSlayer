@@ -98,7 +98,7 @@ public static class FightSearch
         if (_rooms == null || _rooms.Count == 0) return;
         File.WriteAllText(Path.Combine(Probe.OutDir, $"search_{Environment.ProcessId}.json"), Probe.ToJsonCompact(new Dictionary<string, object>
         {
-            ["searches"] = Searches, ["leaves"] = Leaves, ["diverged"] = Diverged, ["errors"] = Errors, ["retries"] = Retries,
+            ["searches"] = Searches, ["leaves"] = Leaves, ["diverged"] = Diverged, ["errors"] = Errors, ["retries"] = Retries, ["stale_skips"] = StaleCombat.Skipped, ["stale_resumed"] = Probe.StaleResumed, ["drain_frames"] = Probe.DrainFrames, ["drain_cap_hits"] = Probe.DrainCapHits, ["abandoned_selects"] = CardSelect.Abandoned, ["stuck_selects"] = Probe.StuckSelects,
             ["ms"] = Math.Round(Ms), ["restore_ms"] = Math.Round(RestoreMs), ["load_ms"] = Math.Round(LoadMs), ["replay_choices"] = ReplayChoices,
             ["roll_ms"] = Math.Round(RollMs), ["eval_ms"] = Math.Round(EvalMs), ["prior_ms"] = Math.Round(PriorMs),
             ["roll_obs_ms"] = Math.Round(RollObsMs), ["roll_ask_ms"] = Math.Round(RollAskMs), ["roll_apply_ms"] = Math.Round(RollApplyMs),
